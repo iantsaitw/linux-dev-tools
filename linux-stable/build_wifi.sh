@@ -6,22 +6,6 @@ WIRELESS_DIR="$KERNEL_ROOT/net/wireless"
 MAC80211_DIR="$KERNEL_ROOT/net/mac80211"
 RTW89_DIR="$KERNEL_ROOT/drivers/net/wireless/realtek/rtw89"
 
-TARGET_DIRS=(
-    "$WIRELESS_DIR"
-    "$MAC80211_DIR"
-    "$RTW89_DIR"
-)
-
-# 定義最終產出的 .ko 檔案路徑
-KO_FILES=(
-    "$WIRELESS_DIR/cfg80211.ko"
-    "$MAC80211_DIR/mac80211.ko"
-    "$RTW89_DIR/rtw89_core.ko"
-    "$RTW89_DIR/rtw89_pci.ko"
-    "$RTW89_DIR/rtw89_8922a.ko"
-    "$RTW89_DIR/rtw89_8922ae.ko"
-)
-
 # 2. 判斷模式
 DO_CLEAN=false
 if [ "$1" == "clean" ]; then
@@ -33,36 +17,40 @@ fi
 
 echo "--------------------------------------------------------"
 
-# 3. 執行編譯循環
-for DIR in "${TARGET_DIRS[@]}"; do
-    if [ -d "$DIR" ]; then
-        echo -e "\e[1;34m📂 Processing Directory: $DIR\e[0m"
-        
-        # 執行 Clean (不再靜音，讓你看得到清除動作)
-        if [ "$DO_CLEAN" = true ]; then
-            make -C "$DIR" -f Makefile.local clean
-        fi
+# --- 第一階段：編譯 cfg80211 ---
+echo -e "\e[1;34m📂 [1/3] Processing cfg80211: $WIRELESS_DIR\e[0m"
+[ "$DO_CLEAN" = true ] && make -C "$WIRELESS_DIR" -f Makefile.local clean
+make -C "$WIRELESS_DIR" -f Makefile.local -j$(nproc)
+if [ $? -ne 0 ]; then echo -e "\e[1;31m❌ Error in cfg80211\e[0m"; exit 1; fi
 
-        # 針對 rtw89 傳入符號表
-        EXTRA_SYMS_ARG=""
-        [[ "$DIR" == *"/rtw89"* ]] && EXTRA_SYMS_ARG="KBUILD_EXTRA_SYMBOLS=$WIRELESS_DIR/Module.symvers"
+# --- 第二階段：編譯 mac80211 (需要 cfg80211 的符號) ---
+echo -e "\e[1;34m📂 [2/3] Processing mac80211: $MAC80211_DIR\e[0m"
+[ "$DO_CLEAN" = true ] && make -C "$MAC80211_DIR" -f Makefile.local clean
+# 傳入 cfg80211 的符號表
+make -C "$MAC80211_DIR" -f Makefile.local -j$(nproc) \
+     KBUILD_EXTRA_SYMBOLS="$WIRELESS_DIR/Module.symvers"
+if [ $? -ne 0 ]; then echo -e "\e[1;31m❌ Error in mac80211\e[0m"; exit 1; fi
 
-        # 執行編譯 (移除 > /dev/null，保留所有輸出)
-        make -C "$DIR" -f Makefile.local -j$(nproc) $EXTRA_SYMS_ARG
-        
-        # 檢查編譯結果
-        if [ $? -eq 0 ]; then
-            echo -e "\e[32m  ✔ $(basename $DIR) compilation finished.\e[0m"
-        else
-            echo -e "\n\e[1;31m❌ Error: Compilation failed in $DIR\e[0m"
-            echo "請向上捲動查看具體錯誤訊息。"
-            exit 1
-        fi
-        echo "--------------------------------------------------------"
-    fi
-done
+# --- 第三階段：編譯 rtw89 (需要 cfg80211 + mac80211 的符號) ---
+echo -e "\e[1;34m📂 [3/3] Processing rtw89: $RTW89_DIR\e[0m"
+[ "$DO_CLEAN" = true ] && make -C "$RTW89_DIR" -f Makefile.local clean
+# 傳入兩者的符號表 (用空格隔開)
+make -C "$RTW89_DIR" -f Makefile.local -j$(nproc) \
+     KBUILD_EXTRA_SYMBOLS="$WIRELESS_DIR/Module.symvers $MAC80211_DIR/Module.symvers"
+if [ $? -ne 0 ]; then echo -e "\e[1;31m❌ Error in rtw89\e[0m"; exit 1; fi
 
-# 4. 最終狀態總結 (Summary) - 只有成功才會走到這
+# --------------------------------------------------------
+
+# 4. 最終狀態總結
+KO_FILES=(
+    "$WIRELESS_DIR/cfg80211.ko"
+    "$MAC80211_DIR/mac80211.ko"
+    "$RTW89_DIR/rtw89_core.ko"
+    "$RTW89_DIR/rtw89_pci.ko"
+    "$RTW89_DIR/rtw89_8922a.ko"
+    "$RTW89_DIR/rtw89_8922ae.ko"
+)
+
 echo -e "\n========================================================"
 echo -e "📊  FINAL BUILD SUMMARY"
 echo -e "========================================================"
