@@ -1,0 +1,311 @@
+From e85ac462d91d6bb038caf616baee3b4634559f67 Mon Sep 17 00:00:00 2001
+From: Sai Pratyusha Magam <smagam@qti.qualcomm.com>
+Date: Thu, 11 Dec 2025 18:44:29 +0530
+Subject: [PATCH 15/29] EPPKE: PTK/MIC Computation and key installation changes
+ in Responder mode
+
+As per IEEE P802.11bi/D2.0, 12.16.9.3.4 (PTKSA derivation
+and MIC computation with EPPKE authentication)
+For MLO, the following modifications shall be used:
+ -The AP MLD MAC address is used instead of the BSSID.
+ -The non-AP MLD MAC address is used instead of the SPA.
+
+In AP Responder mode, if the peer is in unauthorized state,
+and processing of the EPPKE Authentication frame 1 received from
+initiator is successful and results in a PTKSA derivation,
+Install the pairwise key TK to the driver and if the peer is
+already in an authorized state, wait until EPPKE Authentication
+frame 3 validation is successful to install the pairwise key to
+the driver.
+
+Signed-off-by: Sai Pratyusha Magam <smagam@qti.qualcomm.com>
+Signed-off-by: Rohan Dutta <drohan@qti.qualcomm.com>
+---
+ src/ap/ieee802_11.c              | 32 +++++++++++++++++++++++++++++---
+ src/common/wpa_common.c          | 21 +++++++++++++++------
+ src/p2p/p2p.c                    |  3 ++-
+ src/pasn/pasn_common.c           |  8 +++++++-
+ src/pasn/pasn_common.h           | 14 +++++++++++++-
+ src/pasn/pasn_responder.c        | 28 ++++++++++++++++++++++++++++
+ wpa_supplicant/pasn_supplicant.c |  4 ++--
+ 7 files changed, 96 insertions(+), 14 deletions(-)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index c901b4cb1..e578ba202 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -2992,12 +2992,29 @@ static int hapd_pasn_send_mlme(void *ctx, const u8 *data, size_t data_len,
+ }
+ 
+ 
++#ifdef CONFIG_ENC_ASSOC
++static int eppk_set_key(void *ctx, enum wpa_alg alg,
++			const u8 *addr, const u8 *key,
++			size_t key_len)
++{
++	struct hostapd_data *hapd = ctx;
++
++	return hostapd_drv_set_key(hapd->conf->iface, hapd, alg, addr,
++				   0, 0, 1, NULL, 0, key, key_len,
++				   KEY_FLAG_PAIRWISE_RX_TX);
++}
++#else
++#define eppk_set_key NULL
++#endif /* CONFIG_ENC_ASSOC */
++
++
+ static void hapd_initialize_pasn(struct hostapd_data *hapd,
+ 				 struct sta_info *sta)
+ {
+ 	struct pasn_data *pasn = sta->pasn;
+ 
+-	pasn_register_callbacks(pasn, hapd, hapd_pasn_send_mlme, NULL);
++	pasn_register_callbacks(pasn, hapd, hapd_pasn_send_mlme,
++				NULL, eppk_set_key);
+ 	pasn_set_bssid(pasn, hapd->own_addr);
+ 	pasn_set_own_addr(pasn, hapd->own_addr);
+ #if defined(CONFIG_IEEE80211BE) && defined(CONFIG_ENC_ASSOC)
+@@ -3025,6 +3042,7 @@ static void hapd_initialize_pasn(struct hostapd_data *hapd,
+ 	pasn_set_rsnxe_ie(pasn, hostapd_wpa_ie(hapd, WLAN_EID_RSNX));
+ 	pasn->disable_pmksa_caching = hapd->conf->disable_pmksa_caching;
+ #ifdef CONFIG_ENC_ASSOC
++	pasn->tk_configured = false;
+ 	pasn_set_responder_pmksa(pasn,
+ 				 wpa_auth_get_pmksa_cache(hapd->wpa_auth,
+ 							  (sta->epp_sta ?
+@@ -3110,6 +3128,7 @@ static void hapd_pasn_update_params(struct hostapd_data *hapd,
+ 	}
+ #ifdef CONFIG_ENC_ASSOC
+ 	pasn->auth_alg = mgmt->u.auth.auth_alg;
++	pasn->authorized = ap_sta_is_authorized(sta);
+ #ifdef CONFIG_IEEE80211BE
+ 	pasn->is_ml_sta = sta->mld_info.mld_sta;
+ #endif
+@@ -3218,7 +3237,8 @@ static void handle_auth_pasn(struct hostapd_data *hapd, struct sta_info *sta,
+ 			return;
+ 		}
+ 
+-		sta->pasn = pasn_data_init();
++		if (!sta->pasn)
++			sta->pasn = pasn_data_init();
+ 		if (!sta->pasn) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "PASN: Failed to allocate PASN context");
+@@ -3265,7 +3285,13 @@ static void handle_auth_pasn(struct hostapd_data *hapd, struct sta_info *sta,
+ 					pasn_get_ptk(sta->pasn), NULL, NULL,
+ 					pasn_get_akmp(sta->pasn));
+ #ifdef CONFIG_ENC_ASSOC
+-			if (!sta->epp_sta)
++			if (sta->epp_sta && !sta->pasn->tk_configured)
++				sta->pasn->eppk_set_key(sta->pasn->cb_ctx,
++							wpa_cipher_to_alg(sta->pasn->cipher),
++							sta->addr,
++							sta->pasn->ptk.tk,
++							sta->pasn->ptk.tk_len);
++			else if (!sta->epp_sta)
+ #endif /* CONFIG_ENC_ASSOC */
+ 				pasn_set_keys_from_cache(hapd, hapd->own_addr,
+ 							 sta->addr,
+diff --git a/src/common/wpa_common.c b/src/common/wpa_common.c
+index 1284f396c..c18e71cf5 100644
+--- a/src/common/wpa_common.c
++++ b/src/common/wpa_common.c
+@@ -1600,8 +1600,12 @@ int sae_ext_key_group(size_t pmk_len)
+  * pasn_pmk_to_ptk - Calculate PASN/EPPKE PTK from PMK, addresses, etc.
+  * @pmk: Pairwise master key
+  * @pmk_len: Length of PMK
+- * @spa: Suppplicant address
+- * @bssid: AP BSSID
++ * @spa: As per IEEE802.11bi/D2.0, 12.16.9.3.4, for EPPKE authentication,
++ *	Non-AP MLD MAC address is used for MLO. For PASN authentication or
++ *	EPPKE authentication for Non-MLO, Non-AP Link MAC address is used.
++ * @bssid: As per IEEE802.11bi/D2.0, 12.16.9.3.4, for EPPKE authentication,
++ *	AP MLD MAC address is used for MLO. For PASN authentication or EPPKE
++ *	authentication for Non-MLO, AP BSSID is used.
+  * @dhss: Is the shared secret (DHss) derived from the PASN ephemeral key
+  *	exchange encoded as an octet string
+  * @dhss_len: The length of dhss in octets
+@@ -1819,10 +1823,15 @@ int wpa_ltf_keyseed(struct wpa_ptk *ptk, int akmp, int cipher)
+  * @kck_len: KCK length in octets
+  * @akmp: Negotiated AKM
+  * @cipher: Negotiated pairwise cipher
+- * @addr1: For the 2nd PASN frame supplicant address; for the 3rd frame the
+- *	BSSID
+- * @addr2: For the 2nd PASN frame the BSSID; for the 3rd frame the supplicant
+- *	address
++ * @addr1: For the 2nd PASN/EPPKE frame supplicant address is used for Non-MLO;
++ *	for MLO, 2nd EPPKE authentication to use Non-AP MLD MAC address.
++ *	For the 3rd PASN/EPPKE frame BSSID is used for Non-MLO. for MLO, 3rd EPPKE
++ *	authentication to use AP MLD MAC address as per IEEE802.11bi/D2.0, 12.16.9.3.4
++ * @addr2: For the 2nd PASN/EPPKE frame BSSID is used for Non-MLO;
++ *	for MLO, 2nd EPPKE authentication to use AP MLD MAC address.
++ *	For the 3rd PASN/EPPKE frame supplicant address is used for Non-MLO.
++ *	for MLO, 3rd EPPKE authentication frame to use Non-AP MLD MAC address as
++ *	per IEEE802.11bi/D2.0, 12.16.9.3.4
+  * @data: For calculating the MIC for the 2nd PASN frame, this should hold the
+  *	Beacon frame RSNE + RSNXE. For calculating the MIC for the 3rd PASN
+  *	frame, this should hold the hash of the body of the PASN 1st frame.
+diff --git a/src/p2p/p2p.c b/src/p2p/p2p.c
+index 8a97091b4..0c0f04f33 100644
+--- a/src/p2p/p2p.c
++++ b/src/p2p/p2p.c
+@@ -7242,7 +7242,8 @@ int p2p_pasn_auth_rx(struct p2p_data *p2p, const struct ieee80211_mgmt *mgmt,
+ 
+ 	pasn_register_callbacks(pasn, p2p->cfg->cb_ctx,
+ 				p2p->cfg->pasn_send_mgmt,
+-				p2p->cfg->pasn_validate_pmkid);
++				p2p->cfg->pasn_validate_pmkid,
++				NULL);
+ 	auth_transaction = le_to_host16(mgmt->u.auth.auth_transaction);
+ 
+ 	if (dev->role == P2P_ROLE_PAIRING_INITIATOR && auth_transaction == 2) {
+diff --git a/src/pasn/pasn_common.c b/src/pasn/pasn_common.c
+index 0d9a87768..e9b30ba99 100644
+--- a/src/pasn/pasn_common.c
++++ b/src/pasn/pasn_common.c
+@@ -46,7 +46,10 @@ void pasn_register_callbacks(struct pasn_data *pasn, void *cb_ctx,
+ 					      unsigned int wait),
+ 			     int (*validate_custom_pmkid)(void *ctx,
+ 							  const u8 *addr,
+-							  const u8 *pmkid))
++							  const u8 *pmkid),
++			     int (*eppke_set_key)(void *ctx, enum wpa_alg alg,
++						  const u8 *addr, const u8 *key,
++						  size_t key_len))
+ {
+ 	if (!pasn)
+ 		return;
+@@ -54,6 +57,9 @@ void pasn_register_callbacks(struct pasn_data *pasn, void *cb_ctx,
+ 	pasn->cb_ctx = cb_ctx;
+ 	pasn->send_mgmt = send_mgmt;
+ 	pasn->validate_custom_pmkid = validate_custom_pmkid;
++#ifdef CONFIG_ENC_ASSOC
++	pasn->eppk_set_key = eppke_set_key;
++#endif /* CONFIG_ENC_ASSOC */
+ }
+ 
+ 
+diff --git a/src/pasn/pasn_common.h b/src/pasn/pasn_common.h
+index 6be976ba6..ffc3c8b21 100644
+--- a/src/pasn/pasn_common.h
++++ b/src/pasn/pasn_common.h
+@@ -141,6 +141,10 @@ struct pasn_data {
+ 	u16 comeback_idx;
+ 	u16 *comeback_pending_idx;
+ 	struct wpabuf *frame;
++#ifdef CONFIG_ENC_ASSOC
++	bool authorized;
++	bool tk_configured;
++#endif /* CONFIG_ENC_ASSOC */
+ 
+ 	/**
+ 	 * send_mgmt - Function handler to transmit a Management frame
+@@ -166,6 +170,10 @@ struct pasn_data {
+ 	int (*prepare_data_element)(void *ctx, const u8 *peer_addr);
+ 
+ 	int (*parse_data_element)(void *ctx, const u8 *data, size_t len);
++#ifdef CONFIG_ENC_ASSOC
++	int (*eppk_set_key)(void *ctx, enum wpa_alg alg, const u8 *addr,
++			    const u8 *key, size_t key_len);
++#endif /* CONFIG_ENC_ASSOC */
+ };
+ 
+ /* Initiator */
+@@ -208,7 +216,11 @@ void pasn_register_callbacks(struct pasn_data *pasn, void *cb_ctx,
+ 					      unsigned int wait),
+ 			     int (*validate_custom_pmkid)(void *ctx,
+ 							  const u8 *addr,
+-							  const u8 *pmkid));
++							  const u8 *pmkid),
++			     int (*eppke_set_key)(void *ctx, enum wpa_alg alg,
++						  const u8 *addr, const u8 *key,
++						  size_t key_len));
++
+ void pasn_enable_kdk_derivation(struct pasn_data *pasn);
+ void pasn_disable_kdk_derivation(struct pasn_data *pasn);
+ 
+diff --git a/src/pasn/pasn_responder.c b/src/pasn/pasn_responder.c
+index 2a3503b7d..8c9222386 100644
+--- a/src/pasn/pasn_responder.c
++++ b/src/pasn/pasn_responder.c
+@@ -428,6 +428,13 @@ pasn_derive_keys(struct pasn_data *pasn,
+ 
+ 	pasn->pmk_len = pmk_len;
+ 	os_memcpy(pasn->pmk, pmk, pmk_len);
++
++#ifdef CONFIG_ENC_ASSOC
++	if (pasn->auth_alg == WLAN_AUTH_EPPKE &&
++	    pasn->is_ml_sta)
++		own_addr = pasn->mld_addr;
++#endif /* CONFIG_ENC_ASSOC */
++
+ 	ret = pasn_pmk_to_ptk(pmk, pmk_len, peer_addr, own_addr,
+ 			      wpabuf_head(secret), wpabuf_len(secret),
+ 			      &pasn->ptk, pasn->akmp,
+@@ -655,6 +662,12 @@ int handle_auth_pasn_resp(struct pasn_data *pasn, const u8 *own_addr,
+ 		data = rsn_ie;
+ 	}
+ 
++#ifdef CONFIG_ENC_ASSOC
++	if (pasn->auth_alg == WLAN_AUTH_EPPKE &&
++	    pasn->is_ml_sta)
++		own_addr = pasn->mld_addr;
++#endif /* CONFIG_ENC_ASSOC */
++
+ 	ret = pasn_mic(pasn->ptk.kck, pasn->ptk.kck_len, pasn->akmp,
+ 		       pasn->cipher, own_addr, peer_addr, data, data_len,
+ 		       frame, frame_len, mic);
+@@ -1028,6 +1041,14 @@ int handle_auth_pasn_1(struct pasn_data *pasn,
+ 		goto send_resp;
+ 	}
+ 
++#ifdef CONFIG_ENC_ASSOC
++	if (pasn->auth_alg == WLAN_AUTH_EPPKE && !pasn->authorized) {
++		pasn->eppk_set_key(pasn->cb_ctx, wpa_cipher_to_alg(pasn->cipher),
++				   peer_addr, pasn->ptk.tk, pasn->ptk.tk_len);
++		pasn->tk_configured = true;
++	}
++#endif /* CONFIG_ENC_ASSOC */
++
+ 	ret = pasn_auth_frame_hash(pasn->akmp, pasn->cipher,
+ 				   ((const u8 *) mgmt) + IEEE80211_HDRLEN,
+ 				   len - IEEE80211_HDRLEN, pasn->hash,
+@@ -1119,6 +1140,13 @@ int handle_auth_pasn_3(struct pasn_data *pasn, const u8 *own_addr,
+ 	if (!copy)
+ 		goto fail;
+ 	os_memset(copy + mic_offset, 0, mic_len);
++
++#ifdef CONFIG_ENC_ASSOC
++	if (pasn->auth_alg == WLAN_AUTH_EPPKE &&
++	    pasn->is_ml_sta)
++		own_addr = pasn->mld_addr;
++#endif /* CONFIG_ENC_ASSOC */
++
+ 	ret = pasn_mic(pasn->ptk.kck, pasn->ptk.kck_len, pasn->akmp,
+ 		       pasn->cipher, peer_addr, own_addr,
+ 		       pasn->hash, mic_len * 2,
+diff --git a/wpa_supplicant/pasn_supplicant.c b/wpa_supplicant/pasn_supplicant.c
+index 46343ea6e..090df4eee 100644
+--- a/wpa_supplicant/pasn_supplicant.c
++++ b/wpa_supplicant/pasn_supplicant.c
+@@ -715,7 +715,7 @@ static void wpas_pasn_auth_start_cb(struct wpa_radio_work *work, int deinit)
+ 		capab |= BIT(WLAN_RSNX_CAPAB_SPP_A_MSDU);
+ 
+ 	pasn_set_rsnxe_caps(pasn, capab);
+-	pasn_register_callbacks(pasn, wpa_s, wpas_pasn_send_mlme, NULL);
++	pasn_register_callbacks(pasn, wpa_s, wpas_pasn_send_mlme, NULL, NULL);
+ 	ssid = wpa_config_get_network(wpa_s->conf, awork->network_id);
+ 
+ #ifdef CONFIG_SAE
+@@ -973,7 +973,7 @@ int wpas_pasn_auth_rx(struct wpa_supplicant *wpa_s,
+ 	wpabuf_free(pasn->frame);
+ 	pasn->frame = NULL;
+ 
+-	pasn_register_callbacks(pasn, wpa_s, wpas_pasn_send_mlme, NULL);
++	pasn_register_callbacks(pasn, wpa_s, wpas_pasn_send_mlme, NULL, NULL);
+ 	ret = wpa_pasn_auth_rx(pasn, (const u8 *) mgmt, len, &pasn_data);
+ 	if (ret == 0) {
+ 		ptksa_cache_add(wpa_s->ptksa, pasn->own_addr, pasn->peer_addr,
+-- 
+2.43.0
+

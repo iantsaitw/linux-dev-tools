@@ -1,0 +1,47 @@
+From 0ce70202107f78b9b6c091060f1ea6525ba4de92 Mon Sep 17 00:00:00 2001
+From: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+Date: Thu, 11 Dec 2025 18:44:25 +0530
+Subject: [PATCH 11/29] wpa_supplicant: Add CONFIG_ENC_ASSOC for association
+ frame encryption support
+
+Introduce CONFIG_ENC_ASSOC in defconfig and update Makefile to enable
+association frame encryption. When enabled, also set CONFIG_PASN,
+since EPPKE authentication requires association frame encryption and
+relies on the PASN base code.
+
+Signed-off-by: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+---
+ wpa_supplicant/Makefile  | 5 +++++
+ wpa_supplicant/defconfig | 3 +++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/wpa_supplicant/Makefile b/wpa_supplicant/Makefile
+index a7e15658e..5e014c02f 100644
+--- a/wpa_supplicant/Makefile
++++ b/wpa_supplicant/Makefile
+@@ -444,6 +444,11 @@ OBJS += ../src/pasn/pasn_common.o
+ OBJS += pasn_supplicant.o
+ endif
+ 
++ifdef CONFIG_ENC_ASSOC
++CONFIG_PASN=y
++CFLAGS += -DCONFIG_ENC_ASSOC
++endif
++
+ ifdef CONFIG_HS20
+ OBJS += hs20_supplicant.o
+ CFLAGS += -DCONFIG_HS20
+diff --git a/wpa_supplicant/defconfig b/wpa_supplicant/defconfig
+index 52befd8f1..69de1b212 100644
+--- a/wpa_supplicant/defconfig
++++ b/wpa_supplicant/defconfig
+@@ -686,3 +686,6 @@ CONFIG_DPP2=y
+ 
+ # Wi-Fi Aware unsynchronized service discovery (NAN USD)
+ #CONFIG_NAN_USD=y
++
++# IEEE P802.11bi/D2.0 Support (Enhanced service with Privacy Protection)
++#CONFIG_ENC_ASSOC =y
+-- 
+2.43.0
+

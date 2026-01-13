@@ -1,0 +1,118 @@
+From 8283df0c2793e3d9aba9680a1c990cd02327f560 Mon Sep 17 00:00:00 2001
+From: Sai Pratyusha Magam <smagam@qti.qualcomm.com>
+Date: Thu, 11 Dec 2025 18:44:27 +0530
+Subject: [PATCH 13/29] PASN: Modify PASN Authentication frame header APIs
+ based on auth_algo
+
+Modify PASN Authentication frame header API -
+wpa_pasn_build_auth_header() to build EPPKE Authentication
+frame header if auth_algo is WLAN_AUTH_EPPKE else build a
+PASN Authentication frame header
+
+Signed-off-by: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+Signed-off-by: Rohan Dutta <drohan@qti.qualcomm.com>
+Signed-off-by: Sai Pratyusha Magam <smagam@qti.qualcomm.com>
+---
+ src/common/wpa_common.c   | 10 ++++++----
+ src/common/wpa_common.h   |  2 +-
+ src/pasn/pasn_initiator.c |  6 ++++--
+ src/pasn/pasn_responder.c |  5 +++--
+ 4 files changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/src/common/wpa_common.c b/src/common/wpa_common.c
+index f767027f7..1284f396c 100644
+--- a/src/common/wpa_common.c
++++ b/src/common/wpa_common.c
+@@ -3980,15 +3980,17 @@ int wpa_parse_kde_ies(const u8 *buf, size_t len, struct wpa_eapol_ie_parse *ie)
+  * @dst: Destination address
+  * @trans_seq: Authentication transaction sequence number
+  * @status: Authentication status
++ * @is_eppke: EPPKE authentication
+  */
+ void wpa_pasn_build_auth_header(struct wpabuf *buf, const u8 *bssid,
+ 				const u8 *src, const u8 *dst,
+-				u8 trans_seq, u16 status)
++				u8 trans_seq, u16 status, bool is_eppke)
+ {
+ 	struct ieee80211_mgmt *auth;
++	u16 auth_alg = is_eppke ? WLAN_AUTH_EPPKE : WLAN_AUTH_PASN;
+ 
+-	wpa_printf(MSG_DEBUG, "PASN: Add authentication header. trans_seq=%u",
+-		   trans_seq);
++	wpa_printf(MSG_DEBUG, "%s: Add authentication header trans_seq=%u",
++		   is_eppke ? "EPPKE" : "PASN", trans_seq);
+ 
+ 	auth = wpabuf_put(buf, offsetof(struct ieee80211_mgmt,
+ 					u.auth.variable));
+@@ -4001,7 +4003,7 @@ void wpa_pasn_build_auth_header(struct wpabuf *buf, const u8 *bssid,
+ 	os_memcpy(auth->bssid, bssid, ETH_ALEN);
+ 	auth->seq_ctrl = 0;
+ 
+-	auth->u.auth.auth_alg = host_to_le16(WLAN_AUTH_PASN);
++	auth->u.auth.auth_alg = host_to_le16(auth_alg);
+ 	auth->u.auth.auth_transaction = host_to_le16(trans_seq);
+ 	auth->u.auth.status_code = host_to_le16(status);
+ }
+diff --git a/src/common/wpa_common.h b/src/common/wpa_common.h
+index 40f3a8f4c..083e5ba2d 100644
+--- a/src/common/wpa_common.h
++++ b/src/common/wpa_common.h
+@@ -791,7 +791,7 @@ int pasn_auth_frame_hash(int akmp, int cipher, const u8 *data, size_t len,
+ 
+ void wpa_pasn_build_auth_header(struct wpabuf *buf, const u8 *bssid,
+ 				const u8 *src, const u8 *dst,
+-				u8 trans_seq, u16 status);
++				u8 trans_seq, u16 status, bool is_eppke);
+ 
+ int wpa_pasn_add_rsne(struct wpabuf *buf, const u8 *pmkid,
+ 		      int akmp, int cipher);
+diff --git a/src/pasn/pasn_initiator.c b/src/pasn/pasn_initiator.c
+index 44be455aa..0b04fef4c 100644
+--- a/src/pasn/pasn_initiator.c
++++ b/src/pasn/pasn_initiator.c
+@@ -611,7 +611,8 @@ static struct wpabuf * wpas_pasn_build_auth_1(struct pasn_data *pasn,
+ 
+ 	wpa_pasn_build_auth_header(buf, pasn->bssid,
+ 				   pasn->own_addr, pasn->peer_addr,
+-				   pasn->trans_seq + 1, WLAN_STATUS_SUCCESS);
++				   pasn->trans_seq + 1, WLAN_STATUS_SUCCESS,
++				   pasn->auth_alg == WLAN_AUTH_EPPKE);
+ 
+ 	pmkid = NULL;
+ 	if (wpa_key_mgmt_ft(pasn->akmp)) {
+@@ -706,7 +707,8 @@ static struct wpabuf * wpas_pasn_build_auth_3(struct pasn_data *pasn)
+ 
+ 	wpa_pasn_build_auth_header(buf, pasn->bssid,
+ 				   pasn->own_addr, pasn->peer_addr,
+-				   pasn->trans_seq + 1, WLAN_STATUS_SUCCESS);
++				   pasn->trans_seq + 1, WLAN_STATUS_SUCCESS,
++				   pasn->auth_alg == WLAN_AUTH_EPPKE);
+ 
+ 	wrapped_data_buf = wpas_pasn_get_wrapped_data(pasn);
+ 
+diff --git a/src/pasn/pasn_responder.c b/src/pasn/pasn_responder.c
+index c20979bf9..0d3d4a5e3 100644
+--- a/src/pasn/pasn_responder.c
++++ b/src/pasn/pasn_responder.c
+@@ -466,7 +466,8 @@ static void handle_auth_pasn_comeback(struct pasn_data *pasn,
+ 		return;
+ 
+ 	wpa_pasn_build_auth_header(buf, pasn->bssid, own_addr, peer_addr, 2,
+-				   WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY);
++				   WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY,
++				   pasn->auth_alg == WLAN_AUTH_EPPKE);
+ 
+ 	/*
+ 	 * Do not include the group as a part of the token since it is not going
+@@ -524,7 +525,7 @@ int handle_auth_pasn_resp(struct pasn_data *pasn, const u8 *own_addr,
+ 		goto fail;
+ 
+ 	wpa_pasn_build_auth_header(buf, pasn->bssid, own_addr, peer_addr, 2,
+-				   status);
++				   status, pasn->auth_alg == WLAN_AUTH_EPPKE);
+ 
+ 	if (status != WLAN_STATUS_SUCCESS)
+ 		goto done;
+-- 
+2.43.0
+

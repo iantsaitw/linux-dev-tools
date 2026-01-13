@@ -1,0 +1,155 @@
+From e3e07cc7356e8fd5b980fbb62a467d3f4214c1f3 Mon Sep 17 00:00:00 2001
+From: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+Date: Thu, 11 Dec 2025 18:44:26 +0530
+Subject: [PATCH 12/29] EPPKE: Add EPPKE support to PASN PTK derivation per
+ IEEE P802.11bi/D2.0
+
+Extend PASN PTK derivation to support EPPKE authentication as specified
+in IEEE P802.11bi/D2.0, section 12.16.9.3.4. Update the PTK derivation
+label and debug logging to distinguish between PASN and EPPKE
+authentication. Update all relevant function calls to pass the
+new is_eppke parameter.
+
+Signed-off-by: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+---
+ src/ap/ieee802_11.c              |  3 ++-
+ src/common/common_module_tests.c |  2 +-
+ src/common/wpa_common.c          | 11 ++++++++---
+ src/common/wpa_common.h          |  2 +-
+ src/pasn/pasn_common.h           |  1 +
+ src/pasn/pasn_initiator.c        |  3 ++-
+ src/pasn/pasn_responder.c        |  3 ++-
+ 7 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index a198c565a..bec36e073 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -2814,7 +2814,8 @@ static void pasn_fils_auth_resp(struct hostapd_data *hapd,
+ 			      wpabuf_len(pasn->secret),
+ 			      pasn_get_ptk(sta->pasn), pasn_get_akmp(sta->pasn),
+ 			      pasn_get_cipher(sta->pasn), sta->pasn->kdk_len,
+-			      sta->pasn->kek_len);
++			      sta->pasn->kek_len,
++			      pasn->auth_alg == WLAN_AUTH_EPPKE);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: FILS: Failed to derive PTK");
+ 		goto fail;
+diff --git a/src/common/common_module_tests.c b/src/common/common_module_tests.c
+index edbdbfa1a..332207021 100644
+--- a/src/common/common_module_tests.c
++++ b/src/common/common_module_tests.c
+@@ -654,7 +654,7 @@ static int pasn_test_pasn_auth(void)
+ 			      spa_addr, bssid,
+ 			      dhss, sizeof(dhss),
+ 			      &ptk, WPA_KEY_MGMT_PASN, WPA_CIPHER_CCMP,
+-			      WPA_KDK_MAX_LEN, 0);
++			      WPA_KDK_MAX_LEN, 0, false);
+ 
+ 	if (ret)
+ 		return ret;
+diff --git a/src/common/wpa_common.c b/src/common/wpa_common.c
+index 0443cdcfe..f767027f7 100644
+--- a/src/common/wpa_common.c
++++ b/src/common/wpa_common.c
+@@ -1597,7 +1597,7 @@ int sae_ext_key_group(size_t pmk_len)
+ 
+ 
+ /**
+- * pasn_pmk_to_ptk - Calculate PASN PTK from PMK, addresses, etc.
++ * pasn_pmk_to_ptk - Calculate PASN/EPPKE PTK from PMK, addresses, etc.
+  * @pmk: Pairwise master key
+  * @pmk_len: Length of PMK
+  * @spa: Suppplicant address
+@@ -1610,13 +1610,14 @@ int sae_ext_key_group(size_t pmk_len)
+  * @cipher: Negotiated pairwise cipher
+  * @kdk_len: the length in octets that should be derived for HTLK. Can be zero.
+  * @kek_len: The length in octets that should be derived for KEK. Can be zero.
++ * @is_eppke: EPPKE authentication
+  * Returns: 0 on success, -1 on failure
+  */
+ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+ 		    const u8 *spa, const u8 *bssid,
+ 		    const u8 *dhss, size_t dhss_len,
+ 		    struct wpa_ptk *ptk, int akmp, int cipher,
+-		    size_t kdk_len, size_t kek_len)
++		    size_t kdk_len, size_t kek_len, bool is_eppke)
+ {
+ 	u8 tmp[WPA_KCK_MAX_LEN + WPA_KEK_MAX_LEN + WPA_TK_MAX_LEN +
+ 	       WPA_KDK_MAX_LEN];
+@@ -1624,7 +1625,8 @@ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+ 	u8 *data;
+ 	size_t data_len, ptk_len;
+ 	int ret = -1;
+-	const char *label = "PASN PTK Derivation";
++	const char *label = is_eppke ? "EPPKE PTK Derivation" :
++			    "PASN PTK Derivation";
+ 	enum rsn_hash_alg hash_alg;
+ 
+ 	if (!pmk || !pmk_len) {
+@@ -1638,6 +1640,9 @@ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+ 	}
+ 
+ 	/*
++	 * Use "EPPKE PTK Derivation" instead of “PASN PTK Derivation” for
++	 * EPPKE Authentication per IEEE P802.11bi/D2.0, section 12.16.9.3.4.
++	 *
+ 	 * PASN-PTK = KDF(PMK, “PASN PTK Derivation”, SPA || BSSID || DHss)
+ 	 *
+ 	 * KCK = L(PASN-PTK, 0, 256)
+diff --git a/src/common/wpa_common.h b/src/common/wpa_common.h
+index 7455c106f..40f3a8f4c 100644
+--- a/src/common/wpa_common.h
++++ b/src/common/wpa_common.h
+@@ -775,7 +775,7 @@ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+ 		    const u8 *spa, const u8 *bssid,
+ 		    const u8 *dhss, size_t dhss_len,
+ 		    struct wpa_ptk *ptk, int akmp, int cipher,
+-		    size_t kdk_len, size_t kek_len);
++		    size_t kdk_len, size_t kek_len, bool is_eppke);
+ 
+ u8 pasn_mic_len(int akmp, int cipher, size_t pmk_len);
+ 
+diff --git a/src/pasn/pasn_common.h b/src/pasn/pasn_common.h
+index aad9f512e..98355d748 100644
+--- a/src/pasn/pasn_common.h
++++ b/src/pasn/pasn_common.h
+@@ -51,6 +51,7 @@ struct pasn_data {
+ 	bool derive_kdk;
+ 	size_t kdk_len;
+ 	void *cb_ctx;
++	unsigned int auth_alg;
+ 
+ #ifdef CONFIG_SAE
+ 	struct sae_pt *pt;
+diff --git a/src/pasn/pasn_initiator.c b/src/pasn/pasn_initiator.c
+index a7b3fc5e6..44be455aa 100644
+--- a/src/pasn/pasn_initiator.c
++++ b/src/pasn/pasn_initiator.c
+@@ -1317,7 +1317,8 @@ int wpa_pasn_auth_rx(struct pasn_data *pasn, const u8 *data, size_t len,
+ 			      pasn->own_addr, pasn->peer_addr,
+ 			      wpabuf_head(secret), wpabuf_len(secret),
+ 			      &pasn->ptk, pasn->akmp, pasn->cipher,
+-			      pasn->kdk_len, pasn->kek_len);
++			      pasn->kdk_len, pasn->kek_len,
++			      pasn->auth_alg == WLAN_AUTH_EPPKE);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: Failed to derive PTK");
+ 		goto fail;
+diff --git a/src/pasn/pasn_responder.c b/src/pasn/pasn_responder.c
+index 9104f45d1..c20979bf9 100644
+--- a/src/pasn/pasn_responder.c
++++ b/src/pasn/pasn_responder.c
+@@ -428,7 +428,8 @@ pasn_derive_keys(struct pasn_data *pasn,
+ 	ret = pasn_pmk_to_ptk(pmk, pmk_len, peer_addr, own_addr,
+ 			      wpabuf_head(secret), wpabuf_len(secret),
+ 			      &pasn->ptk, pasn->akmp,
+-			      pasn->cipher, pasn->kdk_len, pasn->kek_len);
++			      pasn->cipher, pasn->kdk_len, pasn->kek_len,
++			      pasn->auth_alg == WLAN_AUTH_EPPKE);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: Failed to derive PTK");
+ 		return -1;
+-- 
+2.43.0
+

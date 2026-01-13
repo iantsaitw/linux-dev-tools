@@ -1,0 +1,218 @@
+From 60464c9e8a7452d016e831b1ac70e10d8be0ce57 Mon Sep 17 00:00:00 2001
+From: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+Date: Thu, 11 Dec 2025 18:44:35 +0530
+Subject: [PATCH 21/29] EPPKE: Pass hash algorithm to kernel via
+ NL80211_ATTR_HASH_ALG
+
+Add support for passing the Secure Hash Algorithm(SHA) to the kernel
+via NL80211_CMD_AUTHENTICATE using NL80211_ATTR_HASH_ALG, allowing
+kernel to compute the MIC and generate the hash of the Authentication
+frame as required.
+
+Signed-off-by: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+---
+ src/common/defs.h            |  4 ++++
+ src/common/wpa_common.c      |  6 +++++-
+ src/common/wpa_common.h      |  2 +-
+ src/drivers/driver.h         |  1 +
+ src/drivers/driver_nl80211.c | 21 +++++++++++++++++++++
+ src/pasn/pasn_common.h       |  1 +
+ src/pasn/pasn_initiator.c    |  2 +-
+ src/pasn/pasn_responder.c    |  4 ++--
+ wpa_supplicant/sme.c         |  7 ++++---
+ 9 files changed, 40 insertions(+), 8 deletions(-)
+
+diff --git a/src/common/defs.h b/src/common/defs.h
+index 8f8f97fba..5838d4f7c 100644
+--- a/src/common/defs.h
++++ b/src/common/defs.h
+@@ -213,6 +213,10 @@ static inline int wpa_key_mgmt_cross_akm(int akm)
+ #define WPA_AUTH_ALG_FILS_SK_PFS BIT(6)
+ #define WPA_AUTH_ALG_EPPKE BIT(10)
+ 
++#define WPA_HASH_SHA256 BIT(0)
++#define WPA_HASH_SHA384 BIT(1)
++#define WPA_HASH_SHA512 BIT(2)
++
+ static inline int wpa_auth_alg_fils(int alg)
+ {
+ 	return !!(alg & (WPA_AUTH_ALG_FILS | WPA_AUTH_ALG_FILS_SK_PFS));
+diff --git a/src/common/wpa_common.c b/src/common/wpa_common.c
+index c18e71cf5..29cd21515 100644
+--- a/src/common/wpa_common.c
++++ b/src/common/wpa_common.c
+@@ -1932,10 +1932,11 @@ err:
+  * @hash: On return would hold the computed hash. Should be big enough to handle
+  *	SHA384.
+  * @group: Finite Cyclic Group ID for PASN authentication
++ * @hash_algo: Hash algorithm used for authentication frame hashing
+  * Returns: 0 on success, -1 on failure
+  */
+ int pasn_auth_frame_hash(int akmp, int cipher, const u8 *data, size_t len,
+-			 u8 *hash, int group)
++			 u8 *hash, int group, u32 *hash_algo)
+ {
+ 	enum rsn_hash_alg hash_alg;
+ 
+@@ -1945,16 +1946,19 @@ int pasn_auth_frame_hash(int akmp, int cipher, const u8 *data, size_t len,
+ 	case HASH_SHA512:
+ #ifdef CONFIG_SHA512
+ 		wpa_printf(MSG_DEBUG, "PASN: Frame hash using SHA-512");
++		*hash_algo = WPA_HASH_SHA512;
+ 		return sha512_vector(1, &data, &len, hash);
+ #endif
+ 	case HASH_SHA384:
+ #ifdef CONFIG_SHA384
+ 		wpa_printf(MSG_DEBUG, "PASN: Frame hash using SHA-384");
++		*hash_algo = WPA_HASH_SHA384;
+ 		return sha384_vector(1, &data, &len, hash);
+ #endif
+ 	case HASH_SHA256:
+ 	default:
+ 		wpa_printf(MSG_DEBUG, "PASN: Frame hash using SHA-256");
++		*hash_algo = WPA_HASH_SHA256;
+ 		return sha256_vector(1, &data, &len, hash);
+ 	}
+ }
+diff --git a/src/common/wpa_common.h b/src/common/wpa_common.h
+index 083e5ba2d..ad3c017ec 100644
+--- a/src/common/wpa_common.h
++++ b/src/common/wpa_common.h
+@@ -787,7 +787,7 @@ int pasn_mic(const u8 *kck, size_t kck_len, int akmp, int cipher,
+ int wpa_ltf_keyseed(struct wpa_ptk *ptk, int akmp, int cipher);
+ 
+ int pasn_auth_frame_hash(int akmp, int cipher, const u8 *data, size_t len,
+-			 u8 *hash, int group);
++			 u8 *hash, int group, u32 *hash_algo);
+ 
+ void wpa_pasn_build_auth_header(struct wpabuf *buf, const u8 *bssid,
+ 				const u8 *src, const u8 *dst,
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 53fb9c81f..126ec56a1 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -767,6 +767,7 @@ struct wpa_driver_auth_params {
+ 	size_t wep_key_len[4];
+ 	int wep_tx_keyidx;
+ 	int local_state_change;
++	u32 hash_alg;
+ 
+ 	/**
+ 	 * p2p - Whether this connection is a P2P group
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 019f9360a..96c72dd14 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -4282,6 +4282,18 @@ static enum nl80211_auth_type get_nl_auth_type(int wpa_auth_alg)
+ }
+ 
+ 
++static enum nl80211_hash_alg get_nl_hash_alg(int wpa_hash_alg)
++{
++	if (wpa_hash_alg & WPA_HASH_SHA256)
++		return NL80211_HASH_ALG_SHA256;
++	if (wpa_hash_alg & WPA_HASH_SHA384)
++		return NL80211_HASH_ALG_SHA384;
++	if (wpa_hash_alg & WPA_HASH_SHA512)
++		return NL80211_HASH_ALG_SHA512;
++	return __NL80211_HASH_ALG_INVALID;
++}
++
++
+ static int
+ nl80211_put_bss_membership_selectors(struct wpa_driver_nl80211_data *drv,
+ 				     struct nl_msg *msg)
+@@ -4316,6 +4328,7 @@ static int wpa_driver_nl80211_authenticate(
+ 	int ret = -1, i;
+ 	struct nl_msg *msg;
+ 	enum nl80211_auth_type type;
++	enum nl80211_hash_alg hash_alg;
+ 	enum nl80211_iftype nlmode;
+ 	int count = 0;
+ 	int is_retry;
+@@ -4399,6 +4412,14 @@ retry:
+ 			    params->auth_data))
+ 			goto fail;
+ 	}
++#ifdef CONFIG_ENC_ASSOC
++	if (params->auth_alg == WPA_AUTH_ALG_EPPKE) {
++		hash_alg = get_nl_hash_alg(params->hash_alg);
++		wpa_printf(MSG_DEBUG, "  * Hash Algo %d", hash_alg);
++		if (nla_put_u32(msg, NL80211_ATTR_HASH_ALG, hash_alg))
++			goto fail;
++	}
++#endif /* CONFIG_ENC_ASSOC */
+ 	type = get_nl_auth_type(params->auth_alg);
+ 	wpa_printf(MSG_DEBUG, "  * Auth Type %d", type);
+ 	if (type > NL80211_AUTHTYPE_MAX ||
+diff --git a/src/pasn/pasn_common.h b/src/pasn/pasn_common.h
+index 09a6a15b0..4d35bffd0 100644
+--- a/src/pasn/pasn_common.h
++++ b/src/pasn/pasn_common.h
+@@ -54,6 +54,7 @@ struct pasn_data {
+ 	unsigned int auth_alg;
+ 	u8 mld_addr[ETH_ALEN];
+ 	bool is_ml_sta;
++	u32 hash_alg;
+ 
+ #ifdef CONFIG_SAE
+ 	struct sae_pt *pt;
+diff --git a/src/pasn/pasn_initiator.c b/src/pasn/pasn_initiator.c
+index ce425a5a5..5b29cab3e 100644
+--- a/src/pasn/pasn_initiator.c
++++ b/src/pasn/pasn_initiator.c
+@@ -667,7 +667,7 @@ struct wpabuf *wpas_pasn_build_auth_1(struct pasn_data *pasn,
+ 	ret = pasn_auth_frame_hash(pasn->akmp, pasn->cipher,
+ 				   wpabuf_head_u8(buf) + IEEE80211_HDRLEN,
+ 				   wpabuf_len(buf) - IEEE80211_HDRLEN,
+-				   pasn->hash, pasn->group);
++				   pasn->hash, pasn->group, &pasn->hash_alg);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: Failed to compute hash");
+ 		goto fail;
+diff --git a/src/pasn/pasn_responder.c b/src/pasn/pasn_responder.c
+index a1d2974e8..b4dea5ee5 100644
+--- a/src/pasn/pasn_responder.c
++++ b/src/pasn/pasn_responder.c
+@@ -967,7 +967,7 @@ int handle_auth_pasn_1(struct pasn_data *pasn,
+ 	ret = pasn_auth_frame_hash(pasn->akmp, pasn->cipher,
+ 				   ((const u8 *) mgmt) + IEEE80211_HDRLEN,
+ 				   len - IEEE80211_HDRLEN, pasn->hash,
+-				   pasn->group);
++				   pasn->group, &pasn->hash_alg);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: Failed to compute hash");
+ 		status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+@@ -1052,7 +1052,7 @@ int handle_auth_pasn_1(struct pasn_data *pasn,
+ 	ret = pasn_auth_frame_hash(pasn->akmp, pasn->cipher,
+ 				   ((const u8 *) mgmt) + IEEE80211_HDRLEN,
+ 				   len - IEEE80211_HDRLEN, pasn->hash,
+-				   pasn->group);
++				   pasn->group, &pasn->hash_alg);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: Failed to compute hash");
+ 		status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+diff --git a/wpa_supplicant/sme.c b/wpa_supplicant/sme.c
+index 74ae2825e..c53035bad 100644
+--- a/wpa_supplicant/sme.c
++++ b/wpa_supplicant/sme.c
+@@ -1168,12 +1168,13 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
+ #ifdef CONFIG_ENC_ASSOC
+ 	if (!skip_auth && params.auth_alg == WPA_AUTH_ALG_EPPKE) {
+ 		wpas_eppke_initialize(wpa_s, bss, ssid);
+-		if (start)
++		if (start) {
+ 			resp = wpas_pasn_build_auth_1(&wpa_s->pasn, NULL,
+ 							    false, 0);
+-		else
++			params.hash_alg = wpa_s->pasn.hash_alg;
++		} else {
+ 			resp = wpas_pasn_build_auth_3(&wpa_s->pasn, 0);
+-
++		}
+ 		params.auth_data = wpabuf_head(resp);
+ 		params.auth_data_len = wpabuf_len(resp);
+ 	}
+-- 
+2.43.0
+

@@ -1,0 +1,140 @@
+From 98f83143fb40d5881d1c060f806cad9bea4c51d6 Mon Sep 17 00:00:00 2001
+From: Sai Pratyusha Magam <smagam@qti.qualcomm.com>
+Date: Thu, 11 Dec 2025 18:44:22 +0530
+Subject: [PATCH 08/29] 11bi: Enhanced Privacy Protection (EPP) related
+ definitions
+
+As a preparation to support EPPKE authentication,
+add additional definitions required to support the flow.
+The definitions pertain to the following features
+introduced in draft IEEE P802.11bi/D2.0:
+-(Re)Association Request/Response frame Encryption
+-IEEE802.1x (EAP) Utilizing Authentication farmes
+-PMKSA Caching privacy
+
+Signed-off-by: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+Signed-off-by: Rohan Dutta <drohan@qti.qualcomm.com>
+Signed-off-by: Sai Pratyusha Magam <smagam@qti.qualcomm.com>
+---
+ src/common/defs.h            | 8 ++++++++
+ src/common/ieee802_11_defs.h | 5 +++++
+ src/common/wpa_common.c      | 6 ++++++
+ src/common/wpa_common.h      | 1 +
+ src/drivers/driver_nl80211.c | 3 ++-
+ 5 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/defs.h b/src/common/defs.h
+index 0a79ba2a6..8f8f97fba 100644
+--- a/src/common/defs.h
++++ b/src/common/defs.h
+@@ -52,6 +52,7 @@
+ #define WPA_KEY_MGMT_SAE_EXT_KEY BIT(26)
+ #define WPA_KEY_MGMT_FT_SAE_EXT_KEY BIT(27)
+ #define WPA_KEY_MGMT_IEEE8021X_SHA384 BIT(28)
++#define WPA_KEY_MGMT_EPPKE BIT(29)
+ 
+ 
+ #define WPA_KEY_MGMT_FT (WPA_KEY_MGMT_FT_PSK | \
+@@ -210,12 +211,19 @@ static inline int wpa_key_mgmt_cross_akm(int akm)
+ #define WPA_AUTH_ALG_SAE BIT(4)
+ #define WPA_AUTH_ALG_FILS BIT(5)
+ #define WPA_AUTH_ALG_FILS_SK_PFS BIT(6)
++#define WPA_AUTH_ALG_EPPKE BIT(10)
+ 
+ static inline int wpa_auth_alg_fils(int alg)
+ {
+ 	return !!(alg & (WPA_AUTH_ALG_FILS | WPA_AUTH_ALG_FILS_SK_PFS));
+ }
+ 
++static inline int wpa_auth_alg_eppke(int alg)
++{
++	return !!(alg & WPA_AUTH_ALG_EPPKE);
++}
++
++
+ enum wpa_alg {
+ 	WPA_ALG_NONE,
+ 	WPA_ALG_WEP,
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 5f261332a..86a67f9b7 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -98,6 +98,8 @@
+ #define WLAN_AUTH_FILS_SK_PFS		5
+ #define WLAN_AUTH_FILS_PK		6
+ #define WLAN_AUTH_PASN			7
++#define WLAN_AUTH_1X_UTILIZING_AUTHENTICATION_FRAMES     8
++#define WLAN_AUTH_EPPKE			9
+ #define WLAN_AUTH_LEAP			128
+ 
+ /* Authentication transaction sequence number */
+@@ -629,6 +631,9 @@
+ #define WLAN_RSNX_CAPAB_URNM_MFPR 15
+ #define WLAN_RSNX_CAPAB_KEK_IN_PASN 18
+ #define WLAN_RSNX_CAPAB_SSID_PROTECTION 21
++#define WLAN_RSNX_CAPAB_ASSOC_FRAME_ENCRYPTION 27
++#define WLAN_RSNX_CAPAB_1X_UTILIZING_AUTHENTICATION_FRAMES 28
++#define WLAN_RSNX_CAPAB_PMKSA_CACHING_PRIVACY 29
+ #define WLAN_RSNX_CAPAB_SAE_PW_ID_CHANGE 34
+ 
+ /* Multiple BSSID element subelements */
+diff --git a/src/common/wpa_common.c b/src/common/wpa_common.c
+index 5f43d2d60..0443cdcfe 100644
+--- a/src/common/wpa_common.c
++++ b/src/common/wpa_common.c
+@@ -262,6 +262,8 @@ int rsn_key_mgmt_to_wpa_akm(u32 akm_suite)
+ 	case RSN_AUTH_KEY_MGMT_PASN:
+ 		return WPA_KEY_MGMT_PASN;
+ #endif /* CONFIG_PASN */
++	case RSN_AUTH_KEY_MGMT_EPPKE:
++		return WPA_KEY_MGMT_EPPKE;
+ 	default:
+ 		return 0;
+ 	}
+@@ -2928,6 +2930,8 @@ const char * wpa_key_mgmt_txt(int key_mgmt, int proto)
+ 		return "PASN";
+ 	case WPA_KEY_MGMT_IEEE8021X_SHA384:
+ 		return "WPA2-EAP-SHA384";
++	case WPA_KEY_MGMT_EPPKE:
++		return "EPPKE";
+ 	default:
+ 		return "UNKNOWN";
+ 	}
+@@ -2982,6 +2986,8 @@ u32 wpa_akm_to_suite(int akm)
+ 	if (akm & WPA_KEY_MGMT_PASN)
+ 		return RSN_AUTH_KEY_MGMT_PASN;
+ #endif /* CONFIG_PASN */
++	if (akm & WPA_KEY_MGMT_EPPKE)
++		return RSN_AUTH_KEY_MGMT_EPPKE;
+ 	return 0;
+ }
+ 
+diff --git a/src/common/wpa_common.h b/src/common/wpa_common.h
+index 95d97b6ac..7455c106f 100644
+--- a/src/common/wpa_common.h
++++ b/src/common/wpa_common.h
+@@ -92,6 +92,7 @@ WPA_CIPHER_BIP_CMAC_256)
+ #define RSN_AUTH_KEY_MGMT_802_1X_SHA384 RSN_SELECTOR(0x00, 0x0f, 0xac, 23)
+ #define RSN_AUTH_KEY_MGMT_SAE_EXT_KEY RSN_SELECTOR(0x00, 0x0f, 0xac, 24)
+ #define RSN_AUTH_KEY_MGMT_FT_SAE_EXT_KEY RSN_SELECTOR(0x00, 0x0f, 0xac, 25)
++#define RSN_AUTH_KEY_MGMT_EPPKE RSN_SELECTOR(0x00, 0x0f, 0xac, 29)
+ 
+ #define RSN_AUTH_KEY_MGMT_CCKM RSN_SELECTOR(0x00, 0x40, 0x96, 0x00)
+ #define RSN_AUTH_KEY_MGMT_DPP RSN_SELECTOR(0x50, 0x6f, 0x9a, 0x02)
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 998ade6fe..97a85549f 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -4276,7 +4276,8 @@ static enum nl80211_auth_type get_nl_auth_type(int wpa_auth_alg)
+ 		return NL80211_AUTHTYPE_FILS_SK;
+ 	if (wpa_auth_alg & WPA_AUTH_ALG_FILS_SK_PFS)
+ 		return NL80211_AUTHTYPE_FILS_SK_PFS;
+-
++	if (wpa_auth_alg & WPA_AUTH_ALG_EPPKE)
++		return NL80211_AUTHTYPE_EPPKE;
+ 	return NL80211_AUTHTYPE_MAX + 1;
+ }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,602 @@
+From aa7e7190b41c4650bcc0c268750fb0a3144ba203 Mon Sep 17 00:00:00 2001
+From: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+Date: Thu, 11 Dec 2025 18:44:15 +0530
+Subject: [PATCH 01/29] PASN: Extend Secure Hash Algorithm support for
+ SAE-EXT-KEY AKMs
+
+This commit updates PASN key derivation and MIC handling to
+support SAE-EXT-KEY AKMs and hash algorithm selection in line with
+IEEE 802.11-2024, 12.13.8, 12.13.9 and 12.4.2.
+ -Extend pasn_pmk_to_ptk() and pasn_mic() to select the appropriate
+  hash algorithm (SHA-256/SHA-384/SHA-512) for PRF (PTK derivation)
+  and HMAC (MIC calculation) based on AKMP, cipher and group/PMK length.
+ -Remove the fixed WPA_PASN_KCK_LEN and derive the KCK length
+  dynamically using wpa_kck_len(). Pass the KCK length explicitly
+  to MIC calculation.
+ -Derive PMK length based on the prime length for SAE-H2E case.
+ -Rework pasn_mic_len() to determine MIC length from AKMP, cipher,
+  and PMK length, including SAE-EXT-KEY AKMs.
+ -Update pasn_auth_frame_hash() to take the SAE group into account and
+   select the correct hash algorithm for authentication frame hashing.
+
+Signed-off-by: Sai Pratyusha Magam <smagam@qti.qualcomm.com>
+Signed-off-by: Ainy Kumari <ainy.kumari@oss.qualcomm.com>
+---
+ src/common/wpa_common.c   | 161 ++++++++++++++++++++++++++++++++------
+ src/common/wpa_common.h   |   9 +--
+ src/pasn/pasn_common.h    |   3 +-
+ src/pasn/pasn_initiator.c |  61 +++++++++------
+ src/pasn/pasn_responder.c |  37 ++++++---
+ 5 files changed, 207 insertions(+), 64 deletions(-)
+
+diff --git a/src/common/wpa_common.c b/src/common/wpa_common.c
+index ee8084c42..80c33ca87 100644
+--- a/src/common/wpa_common.c
++++ b/src/common/wpa_common.c
+@@ -47,6 +47,51 @@ static unsigned int wpa_kck_len(int akmp, size_t pmk_len)
+ }
+ 
+ 
++/**
++ * enum rsn_hash_alg - Hash algorithms used for PASN authentication
++ */
++enum rsn_hash_alg {
++	HASH_SHA256,
++	HASH_SHA384,
++	HASH_SHA512
++};
++
++
++/**
++ * pasn_select_hash_alg - Select hash algorithm for PTK derivation and
++ *			  MIC Computation
++ *
++ * @akmp: Authentication and key management protocol
++ * @cipher: The cipher suite
++ * @group: Finite Cyclic group ID used for PASN Authentication
++ *
++ * According to IEEE Std 802.11-2024, Table 9-190—AKM suite selectors, AKMs
++ * 00-0F AC:24 and 00-0F-AC:25 have the length of the PMK, the length
++ * of the SAE key confirmation key, SAE-KCK, and PTK-KCK, and the length of
++ * PTK-KEK depending on the hash algorithm specified in 12.4.2 (see 12.7.1.3
++ * and 12.7.3), i.e, hash algorithm depends on the prime length associated
++ * with the selected group (Table 12-1—Hash algorithm based on length of prime).
++ *
++ * This function extends pasn_use_sha384(), which only handled SHA-256 and
++ * SHA-384.
++ */
++static enum rsn_hash_alg pasn_select_hash_alg(int akmp, int cipher, int group)
++{
++	if (pasn_use_sha384(akmp, cipher))
++		return HASH_SHA384;
++
++#ifdef CONFIG_SAE
++	if (wpa_key_mgmt_sae_ext_key(akmp)) {
++		if (group == 21)
++			return HASH_SHA512;
++		else if (group == 20)
++			return HASH_SHA384;
++	}
++#endif
++	return HASH_SHA256;
++}
++
++
+ #ifdef CONFIG_IEEE80211R
+ static unsigned int wpa_kck2_len(int akmp)
+ {
+@@ -1532,6 +1577,23 @@ bool pasn_use_sha384(int akmp, int cipher)
+ }
+ 
+ 
++/*
++ * sae_ext_key_group - Get the cyclic group from PMK length for SAE-EXT-KEY AKMs
++ */
++int sae_ext_key_group(size_t pmk_len)
++{
++	switch (pmk_len) {
++	case 64:
++		return 21;
++	case 48:
++		return 20;
++	case 32:
++	default:
++		return 19;
++	}
++}
++
++
+ /**
+  * pasn_pmk_to_ptk - Calculate PASN PTK from PMK, addresses, etc.
+  * @pmk: Pairwise master key
+@@ -1561,6 +1623,7 @@ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+ 	size_t data_len, ptk_len;
+ 	int ret = -1;
+ 	const char *label = "PASN PTK Derivation";
++	enum rsn_hash_alg hash_alg;
+ 
+ 	if (!pmk || !pmk_len) {
+ 		wpa_printf(MSG_ERROR, "PASN: No PMK set for PTK derivation");
+@@ -1588,7 +1651,7 @@ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+ 	os_memcpy(data + ETH_ALEN, bssid, ETH_ALEN);
+ 	os_memcpy(data + 2 * ETH_ALEN, dhss, dhss_len);
+ 
+-	ptk->kck_len = WPA_PASN_KCK_LEN;
++	ptk->kck_len = wpa_kck_len(akmp, pmk_len);
+ 	ptk->tk_len = wpa_cipher_key_len(cipher);
+ 	ptk->kdk_len = kdk_len;
+ 	ptk->kek_len = kek_len;
+@@ -1606,15 +1669,29 @@ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+ 	if (ptk_len > sizeof(tmp))
+ 		goto err;
+ 
+-	if (pasn_use_sha384(akmp, cipher)) {
+-		wpa_printf(MSG_DEBUG, "PASN: PTK derivation using SHA384");
++	hash_alg = pasn_select_hash_alg(akmp, cipher,
++					sae_ext_key_group(pmk_len));
+ 
++	switch (hash_alg) {
++	case HASH_SHA512:
++#ifdef CONFIG_SHA512
++		wpa_printf(MSG_DEBUG, "PASN: PTK derivation using SHA512");
++		if (sha512_prf(pmk, pmk_len, label, data, data_len, tmp,
++			       ptk_len) < 0)
++			goto err;
++		break;
++#endif
++	case HASH_SHA384:
++#ifdef CONFIG_SHA384
++		wpa_printf(MSG_DEBUG, "PASN: PTK derivation using SHA384");
+ 		if (sha384_prf(pmk, pmk_len, label, data, data_len, tmp,
+ 			       ptk_len) < 0)
+ 			goto err;
+-	} else {
++		break;
++#endif
++	case HASH_SHA256:
++	default:
+ 		wpa_printf(MSG_DEBUG, "PASN: PTK derivation using SHA256");
+-
+ 		if (sha256_prf(pmk, pmk_len, label, data, data_len, tmp,
+ 			       ptk_len) < 0)
+ 			goto err;
+@@ -1628,9 +1705,9 @@ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+ 	wpa_hexdump_key(MSG_DEBUG, "PASN: PMK", pmk, pmk_len);
+ 	wpa_hexdump_key(MSG_DEBUG, "PASN: PASN-PTK", tmp, ptk_len);
+ 
+-	os_memcpy(ptk->kck, tmp, WPA_PASN_KCK_LEN);
+-	wpa_hexdump_key(MSG_DEBUG, "PASN: KCK:", ptk->kck, WPA_PASN_KCK_LEN);
+-	pos = &tmp[WPA_PASN_KCK_LEN];
++	os_memcpy(ptk->kck, tmp, ptk->kck_len);
++	wpa_hexdump_key(MSG_DEBUG, "PASN: KCK:", ptk->kck, ptk->kck_len);
++	pos = &tmp[ptk->kck_len];
+ 
+ 	if (kek_len) {
+ 		os_memcpy(ptk->kek, pos, kek_len);
+@@ -1661,11 +1738,14 @@ err:
+ /*
+  * pasn_mic_len - Returns the MIC length for PASN authentication
+  */
+-u8 pasn_mic_len(int akmp, int cipher)
++u8 pasn_mic_len(int akmp, int cipher, size_t pmk_len)
+ {
+ 	if (pasn_use_sha384(akmp, cipher))
+ 		return 24;
+ 
++	if (wpa_key_mgmt_sae_ext_key(akmp))
++		return pmk_len / 2;
++
+ 	return 16;
+ }
+ 
+@@ -1729,6 +1809,7 @@ int wpa_ltf_keyseed(struct wpa_ptk *ptk, int akmp, int cipher)
+ /**
+  * pasn_mic - Calculate PASN MIC
+  * @kck: The key confirmation key for the PASN PTKSA
++ * @kck_len: KCK length in octets
+  * @akmp: Negotiated AKM
+  * @cipher: Negotiated pairwise cipher
+  * @addr1: For the 2nd PASN frame supplicant address; for the 3rd frame the
+@@ -1746,15 +1827,17 @@ int wpa_ltf_keyseed(struct wpa_ptk *ptk, int akmp, int cipher)
+  *	maximal MIC length
+  * Returns: 0 on success, -1 on failure
+  */
+-int pasn_mic(const u8 *kck, int akmp, int cipher,
++int pasn_mic(const u8 *kck, size_t kck_len, int akmp, int cipher,
+ 	     const u8 *addr1, const u8 *addr2,
+ 	     const u8 *data, size_t data_len,
+ 	     const u8 *frame, size_t frame_len, u8 *mic)
+ {
+ 	u8 *buf;
+-	u8 hash[SHA384_MAC_LEN];
++	u8 hash[SHA512_MAC_LEN];
+ 	size_t buf_len = 2 * ETH_ALEN + data_len + frame_len;
+ 	int ret = -1;
++	enum rsn_hash_alg hash_alg;
++	u8 mic_len;
+ 
+ 	if (!kck) {
+ 		wpa_printf(MSG_ERROR, "PASN: No KCK for MIC calculation");
+@@ -1784,27 +1867,39 @@ int pasn_mic(const u8 *kck, int akmp, int cipher,
+ 	wpa_hexdump_key(MSG_DEBUG, "PASN: MIC: frame", frame, frame_len);
+ 	os_memcpy(buf + 2 * ETH_ALEN + data_len, frame, frame_len);
+ 
+-	wpa_hexdump_key(MSG_DEBUG, "PASN: MIC: KCK", kck, WPA_PASN_KCK_LEN);
++	wpa_hexdump_key(MSG_DEBUG, "PASN: MIC: KCK", kck, kck_len);
+ 	wpa_hexdump_key(MSG_DEBUG, "PASN: MIC: buf", buf, buf_len);
+ 
+-	if (pasn_use_sha384(akmp, cipher)) {
+-		wpa_printf(MSG_DEBUG, "PASN: MIC using HMAC-SHA384");
++	hash_alg = pasn_select_hash_alg(akmp, cipher, sae_ext_key_group(kck_len * 2));
++	mic_len = pasn_mic_len(akmp, cipher, kck_len * 2);
+ 
+-		if (hmac_sha384(kck, WPA_PASN_KCK_LEN, buf, buf_len, hash))
++	switch (hash_alg) {
++	case HASH_SHA512:
++#ifdef CONFIG_SHA512
++		wpa_printf(MSG_DEBUG, "PASN: MIC using HMAC-SHA512");
++		if (hmac_sha512(kck, kck_len, buf, buf_len, hash))
+ 			goto err;
+-
+-		os_memcpy(mic, hash, 24);
+-		wpa_hexdump_key(MSG_DEBUG, "PASN: MIC: mic: ", mic, 24);
+-	} else {
++		break;
++#endif
++	case HASH_SHA384:
++#ifdef CONFIG_SHA384
++		wpa_printf(MSG_DEBUG, "PASN: MIC using HMAC-SHA384");
++		if (hmac_sha384(kck, kck_len, buf, buf_len, hash))
++			goto err;
++		break;
++#endif
++	case HASH_SHA256:
++	default:
+ 		wpa_printf(MSG_DEBUG, "PASN: MIC using HMAC-SHA256");
+ 
+-		if (hmac_sha256(kck, WPA_PASN_KCK_LEN, buf, buf_len, hash))
++		if (hmac_sha256(kck, kck_len, buf, buf_len, hash))
+ 			goto err;
+-
+-		os_memcpy(mic, hash, 16);
+-		wpa_hexdump_key(MSG_DEBUG, "PASN: MIC: mic: ", mic, 16);
+ 	}
+ 
++	wpa_printf(MSG_DEBUG, "PASN: MIC length = %d", mic_len);
++	os_memcpy(mic, hash, mic_len);
++	wpa_hexdump_key(MSG_DEBUG, "PASN: MIC: mic: ", mic, mic_len);
++
+ 	ret = 0;
+ err:
+ 	bin_clear_free(buf, buf_len);
+@@ -1820,15 +1915,29 @@ err:
+  * @len: Length of the Authentication frame body
+  * @hash: On return would hold the computed hash. Should be big enough to handle
+  *	SHA384.
++ * @group: Finite Cyclic Group ID for PASN authentication
+  * Returns: 0 on success, -1 on failure
+  */
+ int pasn_auth_frame_hash(int akmp, int cipher, const u8 *data, size_t len,
+-			 u8 *hash)
++			 u8 *hash, int group)
+ {
+-	if (pasn_use_sha384(akmp, cipher)) {
++	enum rsn_hash_alg hash_alg;
++
++	hash_alg = pasn_select_hash_alg(akmp, cipher, group);
++
++	switch (hash_alg) {
++	case HASH_SHA512:
++#ifdef CONFIG_SHA512
++		wpa_printf(MSG_DEBUG, "PASN: Frame hash using SHA-512");
++		return sha512_vector(1, &data, &len, hash);
++#endif
++	case HASH_SHA384:
++#ifdef CONFIG_SHA384
+ 		wpa_printf(MSG_DEBUG, "PASN: Frame hash using SHA-384");
+ 		return sha384_vector(1, &data, &len, hash);
+-	} else {
++#endif
++	case HASH_SHA256:
++	default:
+ 		wpa_printf(MSG_DEBUG, "PASN: Frame hash using SHA-256");
+ 		return sha256_vector(1, &data, &len, hash);
+ 	}
+diff --git a/src/common/wpa_common.h b/src/common/wpa_common.h
+index 92f5d5df6..44713320a 100644
+--- a/src/common/wpa_common.h
++++ b/src/common/wpa_common.h
+@@ -23,7 +23,7 @@
+ #define WPA_GMK_LEN 32
+ #define WPA_GTK_MAX_LEN 32
+ #define WPA_PASN_PMK_LEN 32
+-#define WPA_PASN_MAX_MIC_LEN 24
++#define WPA_PASN_MAX_MIC_LEN 32
+ #define WPA_MAX_RSNXE_LEN 4
+ 
+ #define OWE_DH_GROUP 19
+@@ -246,7 +246,6 @@ struct wpa_eapol_key {
+ #define WPA_KDK_MAX_LEN 32
+ #define FILS_ICK_MAX_LEN 48
+ #define FILS_FT_MAX_LEN 48
+-#define WPA_PASN_KCK_LEN 32
+ #define WPA_PASN_MIC_MAX_LEN 24
+ #define WPA_LTF_KEYSEED_MAX_LEN 48
+ 
+@@ -777,9 +776,9 @@ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+ 		    struct wpa_ptk *ptk, int akmp, int cipher,
+ 		    size_t kdk_len, size_t kek_len);
+ 
+-u8 pasn_mic_len(int akmp, int cipher);
++u8 pasn_mic_len(int akmp, int cipher, size_t pmk_len);
+ 
+-int pasn_mic(const u8 *kck, int akmp, int cipher,
++int pasn_mic(const u8 *kck, size_t kck_len, int akmp, int cipher,
+ 	     const u8 *addr1, const u8 *addr2,
+ 	     const u8 *data, size_t data_len,
+ 	     const u8 *frame, size_t frame_len, u8 *mic);
+@@ -787,7 +786,7 @@ int pasn_mic(const u8 *kck, int akmp, int cipher,
+ int wpa_ltf_keyseed(struct wpa_ptk *ptk, int akmp, int cipher);
+ 
+ int pasn_auth_frame_hash(int akmp, int cipher, const u8 *data, size_t len,
+-			 u8 *hash);
++			 u8 *hash, int group);
+ 
+ void wpa_pasn_build_auth_header(struct wpabuf *buf, const u8 *bssid,
+ 				const u8 *src, const u8 *dst,
+diff --git a/src/pasn/pasn_common.h b/src/pasn/pasn_common.h
+index 182b76558..e0bd682fa 100644
+--- a/src/pasn/pasn_common.h
++++ b/src/pasn/pasn_common.h
+@@ -17,6 +17,7 @@
+ #include "common/sae.h"
+ #endif /* CONFIG_SAE */
+ #include "crypto/sha384.h"
++#include "crypto/sha512.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -85,7 +86,7 @@ struct pasn_data {
+ 	u8 pmk[PMK_LEN_MAX];
+ 	bool using_pmksa;
+ 
+-	u8 hash[SHA384_MAC_LEN];
++	u8 hash[SHA512_MAC_LEN];
+ 
+ 	struct wpabuf *beacon_rsne_rsnxe;
+ 	struct wpa_ptk ptk;
+diff --git a/src/pasn/pasn_initiator.c b/src/pasn/pasn_initiator.c
+index 7bf6e6232..4638f1cf5 100644
+--- a/src/pasn/pasn_initiator.c
++++ b/src/pasn/pasn_initiator.c
+@@ -107,6 +107,7 @@ static struct wpabuf * wpas_pasn_wd_sae_commit(struct pasn_data *pasn)
+ 		return NULL;
+ 	}
+ 
++	pasn->sae.akmp = pasn->akmp;
+ 	ret = sae_prepare_commit_pt(&pasn->sae, pasn->pt,
+ 				    pasn->own_addr, pasn->peer_addr,
+ 				    NULL, NULL);
+@@ -659,7 +660,7 @@ static struct wpabuf * wpas_pasn_build_auth_1(struct pasn_data *pasn,
+ 	ret = pasn_auth_frame_hash(pasn->akmp, pasn->cipher,
+ 				   wpabuf_head_u8(buf) + IEEE80211_HDRLEN,
+ 				   wpabuf_len(buf) - IEEE80211_HDRLEN,
+-				   pasn->hash);
++				   pasn->hash, pasn->group);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: Failed to compute hash");
+ 		goto fail;
+@@ -726,7 +727,7 @@ static struct wpabuf * wpas_pasn_build_auth_3(struct pasn_data *pasn)
+ 	wpa_pasn_add_extra_ies(buf, pasn->extra_ies, pasn->extra_ies_len);
+ 
+ 	/* Add the MIC */
+-	mic_len = pasn_mic_len(pasn->akmp, pasn->cipher);
++	mic_len = pasn_mic_len(pasn->akmp, pasn->cipher, pasn->pmk_len);
+ 	wpabuf_put_u8(buf, WLAN_EID_MIC);
+ 	wpabuf_put_u8(buf, mic_len);
+ 	ptr = wpabuf_put(buf, mic_len);
+@@ -736,8 +737,8 @@ static struct wpabuf * wpas_pasn_build_auth_3(struct pasn_data *pasn)
+ 	data = wpabuf_head_u8(buf) + IEEE80211_HDRLEN;
+ 	data_len = wpabuf_len(buf) - IEEE80211_HDRLEN;
+ 
+-	ret = pasn_mic(pasn->ptk.kck, pasn->akmp, pasn->cipher,
+-		       pasn->own_addr, pasn->peer_addr,
++	ret = pasn_mic(pasn->ptk.kck, pasn->ptk.kck_len, pasn->akmp,
++		       pasn->cipher, pasn->own_addr, pasn->peer_addr,
+ 		       pasn->hash, mic_len * 2, data, data_len, mic);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: frame 3: Failed MIC calculation");
+@@ -909,9 +910,23 @@ static int wpas_pasn_set_pmk(struct pasn_data *pasn,
+ 			return -1;
+ 		}
+ 
+-		wpa_printf(MSG_DEBUG, "PASN: Success deriving PMK with SAE");
+-		pasn->pmk_len = PMK_LEN;
+-		os_memcpy(pasn->pmk, pasn->sae.pmk, PMK_LEN);
++		wpa_printf(MSG_DEBUG, "PASN: Success deriving PMK");
++		if (pasn->akmp == WPA_KEY_MGMT_SAE_EXT_KEY) {
++			size_t hash_len, prime_len = pasn->sae.tmp->prime_len;
++
++			if (!pasn->sae.h2e)
++				hash_len = PMK_LEN;
++			else if (pasn->sae.tmp->dh)
++				hash_len = sae_ffc_prime_len_2_hash_len(prime_len);
++			else
++				hash_len = sae_ecc_prime_len_2_hash_len(prime_len);
++
++			pasn->pmk_len = hash_len;
++			os_memcpy(pasn->pmk, pasn->sae.pmk, hash_len);
++		} else {
++			pasn->pmk_len = PMK_LEN;
++			os_memcpy(pasn->pmk, pasn->sae.pmk, PMK_LEN);
++		}
+ 
+ 		pasn->pmksa_entry = pmksa_cache_add(pasn->pmksa, pasn->pmk,
+ 						    pasn->pmk_len,
+@@ -1183,18 +1198,6 @@ int wpa_pasn_auth_rx(struct pasn_data *pasn, const u8 *data, size_t len,
+ 		goto fail;
+ 	}
+ 
+-	/* Check that the MIC IE exists. Save it and zero out the memory */
+-	mic_len = pasn_mic_len(pasn->akmp, pasn->cipher);
+-	if (status == WLAN_STATUS_SUCCESS) {
+-		if (!elems.mic || elems.mic_len != mic_len) {
+-			wpa_printf(MSG_DEBUG,
+-				   "PASN: Invalid MIC. Expecting len=%u",
+-				   mic_len);
+-			goto fail;
+-		}
+-		os_memcpy(mic, elems.mic, mic_len);
+-	}
+-
+ 	if (!elems.pasn_params || !elems.pasn_params_len) {
+ 		wpa_printf(MSG_DEBUG,
+ 			   "PASN: Missing PASN Parameters IE");
+@@ -1334,6 +1337,18 @@ int wpa_pasn_auth_rx(struct pasn_data *pasn, const u8 *data, size_t len,
+ 	wpabuf_free(secret);
+ 	secret = NULL;
+ 
++	/* Check that the MIC IE exists. Save it and zero out the memory */
++	mic_len = pasn_mic_len(pasn->akmp, pasn->cipher, pasn->pmk_len);
++	if (status == WLAN_STATUS_SUCCESS) {
++		if (!elems.mic || elems.mic_len != mic_len) {
++			wpa_printf(MSG_DEBUG,
++				   "PASN: Invalid MIC. Expecting len=%u",
++				   mic_len);
++			goto fail;
++		}
++		os_memcpy(mic, elems.mic, mic_len);
++	}
++
+ 	/* Use a copy of the message since we need to clear the MIC field */
+ 	if (!elems.mic)
+ 		goto fail;
+@@ -1348,8 +1363,8 @@ int wpa_pasn_auth_rx(struct pasn_data *pasn, const u8 *data, size_t len,
+ 
+ 	if (pasn->beacon_rsne_rsnxe) {
+ 		/* Verify the MIC */
+-		ret = pasn_mic(pasn->ptk.kck, pasn->akmp, pasn->cipher,
+-			       pasn->peer_addr, pasn->own_addr,
++		ret = pasn_mic(pasn->ptk.kck, pasn->ptk.kck_len, pasn->akmp,
++			       pasn->cipher, pasn->peer_addr, pasn->own_addr,
+ 			       wpabuf_head(pasn->beacon_rsne_rsnxe),
+ 			       wpabuf_len(pasn->beacon_rsne_rsnxe),
+ 			       copy, copy_len, out_mic);
+@@ -1383,8 +1398,8 @@ int wpa_pasn_auth_rx(struct pasn_data *pasn, const u8 *data, size_t len,
+ 				rsne_rsnxe, rsne_rsnxe_len);
+ 
+ 		/* Verify the MIC */
+-		ret = pasn_mic(pasn->ptk.kck, pasn->akmp, pasn->cipher,
+-			       pasn->peer_addr, pasn->own_addr,
++		ret = pasn_mic(pasn->ptk.kck, pasn->ptk.kck_len, pasn->akmp,
++			       pasn->cipher, pasn->peer_addr, pasn->own_addr,
+ 			       rsne_rsnxe,
+ 			       rsne_rsnxe_len,
+ 			       copy, copy_len, out_mic);
+diff --git a/src/pasn/pasn_responder.c b/src/pasn/pasn_responder.c
+index cd5fc5e41..813fc572d 100644
+--- a/src/pasn/pasn_responder.c
++++ b/src/pasn/pasn_responder.c
+@@ -141,6 +141,7 @@ static int pasn_wd_handle_sae_commit(struct pasn_data *pasn,
+ 		return -1;
+ 	}
+ 
++	pasn->sae.akmp = pasn->akmp;
+ 	if (!pasn->password || !pasn->pt) {
+ 		wpa_printf(MSG_DEBUG, "PASN: No SAE PT found");
+ 		return -1;
+@@ -390,14 +391,30 @@ pasn_derive_keys(struct pasn_data *pasn,
+ 		switch (pasn->akmp) {
+ #ifdef CONFIG_SAE
+ 		case WPA_KEY_MGMT_SAE:
+-		case WPA_KEY_MGMT_SAE_EXT_KEY:
+ 			if (pasn->sae.state == SAE_COMMITTED) {
+ 				pmk_len = PMK_LEN;
+ 				os_memcpy(pmk, pasn->sae.pmk, PMK_LEN);
+ 				break;
+ 			}
++		case WPA_KEY_MGMT_SAE_EXT_KEY: {
++			size_t hash_len, prime_len = pasn->sae.tmp->prime_len;
++
++			if (!pasn->sae.h2e)
++				hash_len = SHA256_MAC_LEN;
++			else if (pasn->sae.tmp->dh)
++				hash_len =
++					sae_ffc_prime_len_2_hash_len(prime_len);
++			else
++				hash_len = sae_ecc_prime_len_2_hash_len(prime_len);
++
++			if (pasn->sae.state == SAE_COMMITTED) {
++				pmk_len = hash_len;
++				os_memcpy(pmk, pasn->sae.pmk, pmk_len);
++				break;
++			}
+ #endif /* CONFIG_SAE */
+ 			/* fall through */
++		}
+ 		default:
+ 			/* TODO: Derive PMK based on wrapped data */
+ 			wpa_printf(MSG_DEBUG,
+@@ -572,7 +589,7 @@ int handle_auth_pasn_resp(struct pasn_data *pasn, const u8 *own_addr,
+ 	wpa_pasn_add_extra_ies(buf, pasn->extra_ies, pasn->extra_ies_len);
+ 
+ 	/* Add the mic */
+-	mic_len = pasn_mic_len(pasn->akmp, pasn->cipher);
++	mic_len = pasn_mic_len(pasn->akmp, pasn->cipher, pasn->pmk_len);
+ 	wpabuf_put_u8(buf, WLAN_EID_MIC);
+ 	wpabuf_put_u8(buf, mic_len);
+ 	ptr = wpabuf_put(buf, mic_len);
+@@ -622,8 +639,8 @@ int handle_auth_pasn_resp(struct pasn_data *pasn, const u8 *own_addr,
+ 		data = rsn_ie;
+ 	}
+ 
+-	ret = pasn_mic(pasn->ptk.kck, pasn->akmp, pasn->cipher,
+-		       own_addr, peer_addr, data, data_len,
++	ret = pasn_mic(pasn->ptk.kck, pasn->ptk.kck_len, pasn->akmp,
++		       pasn->cipher, own_addr, peer_addr, data, data_len,
+ 		       frame, frame_len, mic);
+ 	os_free(data_buf);
+ 	if (ret) {
+@@ -898,7 +915,8 @@ int handle_auth_pasn_1(struct pasn_data *pasn,
+ 
+ 	ret = pasn_auth_frame_hash(pasn->akmp, pasn->cipher,
+ 				   ((const u8 *) mgmt) + IEEE80211_HDRLEN,
+-				   len - IEEE80211_HDRLEN, pasn->hash);
++				   len - IEEE80211_HDRLEN, pasn->hash,
++				   pasn->group);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: Failed to compute hash");
+ 		status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+@@ -974,7 +992,8 @@ int handle_auth_pasn_1(struct pasn_data *pasn,
+ 
+ 	ret = pasn_auth_frame_hash(pasn->akmp, pasn->cipher,
+ 				   ((const u8 *) mgmt) + IEEE80211_HDRLEN,
+-				   len - IEEE80211_HDRLEN, pasn->hash);
++				   len - IEEE80211_HDRLEN, pasn->hash,
++				   pasn->group);
+ 	if (ret) {
+ 		wpa_printf(MSG_DEBUG, "PASN: Failed to compute hash");
+ 		status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+@@ -1023,7 +1042,7 @@ int handle_auth_pasn_3(struct pasn_data *pasn, const u8 *own_addr,
+ 	}
+ 
+ 	/* Check that the MIC IE exists. Save it and zero out the memory. */
+-	mic_len = pasn_mic_len(pasn->akmp, pasn->cipher);
++	mic_len = pasn_mic_len(pasn->akmp, pasn->cipher, pasn->pmk_len);
+ 	if (!elems.mic || elems.mic_len != mic_len) {
+ 		wpa_printf(MSG_DEBUG,
+ 			   "PASN: Invalid MIC. Expecting len=%u", mic_len);
+@@ -1062,8 +1081,8 @@ int handle_auth_pasn_3(struct pasn_data *pasn, const u8 *own_addr,
+ 	if (!copy)
+ 		goto fail;
+ 	os_memset(copy + mic_offset, 0, mic_len);
+-	ret = pasn_mic(pasn->ptk.kck, pasn->akmp, pasn->cipher,
+-		       peer_addr, own_addr,
++	ret = pasn_mic(pasn->ptk.kck, pasn->ptk.kck_len, pasn->akmp,
++		       pasn->cipher, peer_addr, own_addr,
+ 		       pasn->hash, mic_len * 2,
+ 		       copy, copy_len, out_mic);
+ 	os_free(copy);
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- Configuration ---
-INTERFACE="wlp3s0"
+INTERFACE="wlan0"
 SUPPLICANT="./wpa_supplicant"
 LOG_FILE="wpa_debug.log"
 OLD_LOG="${LOG_FILE}.old"

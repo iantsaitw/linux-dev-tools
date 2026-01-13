@@ -1,0 +1,373 @@
+From 905e69bbe199c657ea57a03d26046329a0e1eda8 Mon Sep 17 00:00:00 2001
+From: Kavita Kavita <kavita.kavita@oss.qualcomm.com>
+Date: Thu, 11 Dec 2025 18:44:37 +0530
+Subject: [PATCH 23/29] sme: Add support to install temporal key for EPPKE
+ Authentication Protocol
+
+Add support to install the temporal key for Enhanced Privacy Protection
+Key Exchange (EPPKE) as specified in section 12.16.9 of
+IEEE P802.11bi/D2.0 after authentication completes.
+
+This commit add support to configure temporal key TK with the driver
+immediately after authentication completes.
+
+Signed-off-by: Kavita Kavita <kavita.kavita@oss.qualcomm.com>
+---
+ src/drivers/driver.h            |  5 +++++
+ src/drivers/driver_nl80211.c    |  6 ++++++
+ wpa_supplicant/ctrl_iface.c     | 20 ++++++++++----------
+ wpa_supplicant/driver_i.h       |  3 ++-
+ wpa_supplicant/events.c         |  2 +-
+ wpa_supplicant/ibss_rsn.c       |  6 +++---
+ wpa_supplicant/mesh_mpm.c       |  6 +++---
+ wpa_supplicant/mesh_rsn.c       |  7 ++++---
+ wpa_supplicant/sme.c            |  9 +++++++++
+ wpa_supplicant/wpa_supplicant.c | 12 +++++++-----
+ wpa_supplicant/wpas_glue.c      |  9 +++++----
+ 11 files changed, 55 insertions(+), 30 deletions(-)
+
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 2bbe7f621..759f9f62d 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -2096,6 +2096,11 @@ struct wpa_driver_set_key_params {
+ 	 *
+ 	 * Set to a valid Link ID (0-14) when applicable, otherwise -1. */
+ 	int link_id;
++
++	/**
++	 * preassoc_key - Indicate key is for pre-association use
++	 */
++	bool preassoc_key;
+ };
+ 
+ enum wpa_driver_if_type {
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 999a3e7d0..76ed5d1c5 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -3771,6 +3771,7 @@ static int wpa_driver_nl80211_set_key(struct i802_bss *bss,
+ 	int vlan_id = params->vlan_id;
+ 	enum key_flag key_flag = params->key_flag;
+ 	int link_id = params->link_id;
++	bool preassoc_key = params->preassoc_key;
+ 
+ 	/* Ignore for P2P Device */
+ 	if (drv->nlmode == NL80211_IFTYPE_P2P_DEVICE)
+@@ -3903,6 +3904,10 @@ static int wpa_driver_nl80211_set_key(struct i802_bss *bss,
+ 		if (key_flag & KEY_FLAG_DEFAULT)
+ 			skip_set_key = 0;
+ 	}
++
++	if (preassoc_key)
++		nla_put_flag(msg, NL80211_ATTR_KEY_PREASSOC);
++
+ 	if (nla_put_u8(key_msg, NL80211_KEY_IDX, key_idx) ||
+ 	    nla_put_nested(msg, NL80211_ATTR_KEY, key_msg))
+ 		goto fail;
+@@ -3923,6 +3928,7 @@ static int wpa_driver_nl80211_set_key(struct i802_bss *bss,
+ 	}
+ 
+ 	ret = send_and_recv_cmd(drv, msg);
++
+ 	if ((ret == -ENOENT || ret == -ENOLINK) && alg == WPA_ALG_NONE)
+ 		ret = 0;
+ 	if (ret)
+diff --git a/wpa_supplicant/ctrl_iface.c b/wpa_supplicant/ctrl_iface.c
+index 750b476b9..feadfd4af 100644
+--- a/wpa_supplicant/ctrl_iface.c
++++ b/wpa_supplicant/ctrl_iface.c
+@@ -6021,23 +6021,23 @@ static void wpa_supplicant_ctrl_iface_drop_sa(struct wpa_supplicant *wpa_s)
+ 	wpa_printf(MSG_DEBUG, "Dropping SA without deauthentication");
+ 	/* MLME-DELETEKEYS.request */
+ 	wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, NULL, 0, 0, NULL, 0, NULL,
+-			0, KEY_FLAG_GROUP);
++			0, KEY_FLAG_GROUP, false);
+ 	wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, NULL, 1, 0, NULL, 0, NULL,
+-			0, KEY_FLAG_GROUP);
++			0, KEY_FLAG_GROUP, false);
+ 	wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, NULL, 2, 0, NULL, 0, NULL,
+-			0, KEY_FLAG_GROUP);
++			0, KEY_FLAG_GROUP, false);
+ 	wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, NULL, 3, 0, NULL, 0, NULL,
+-			0, KEY_FLAG_GROUP);
++			0, KEY_FLAG_GROUP, false);
+ 	wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, NULL, 4, 0, NULL, 0, NULL,
+-			0, KEY_FLAG_GROUP);
++			0, KEY_FLAG_GROUP, false);
+ 	wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, NULL, 5, 0, NULL, 0, NULL,
+-			0, KEY_FLAG_GROUP);
++			0, KEY_FLAG_GROUP, false);
+ 
+ 	wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, wpa_s->bssid, 0, 0, NULL, 0,
+-			NULL, 0, KEY_FLAG_PAIRWISE);
++			NULL, 0, KEY_FLAG_PAIRWISE, false);
+ 	if (wpa_sm_ext_key_id(wpa_s->wpa))
+ 		wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, wpa_s->bssid, 1, 0,
+-				NULL, 0, NULL, 0, KEY_FLAG_PAIRWISE);
++				NULL, 0, NULL, 0, KEY_FLAG_PAIRWISE, false);
+ 	/* MLME-SETPROTECTION.request(None) */
+ 	wpa_drv_mlme_setprotection(wpa_s, wpa_s->bssid,
+ 				   MLME_SETPROTECTION_PROTECT_TYPE_NONE,
+@@ -10498,7 +10498,7 @@ static int wpas_ctrl_reset_pn(struct wpa_supplicant *wpa_s)
+ 	if (wpa_drv_set_key(wpa_s, -1, wpa_s->last_tk_alg, wpa_s->last_tk_addr,
+ 			    wpa_s->last_tk_key_idx, 1, zero, 6,
+ 			    zero, wpa_s->last_tk_len,
+-			    KEY_FLAG_PAIRWISE_RX_TX) < 0)
++			    KEY_FLAG_PAIRWISE_RX_TX, false) < 0)
+ 		return -1;
+ 
+ 	/* Set the previously configured key to reset its TSC/RSC */
+@@ -10506,7 +10506,7 @@ static int wpas_ctrl_reset_pn(struct wpa_supplicant *wpa_s)
+ 			       wpa_s->last_tk_addr,
+ 			       wpa_s->last_tk_key_idx, 1, zero, 6,
+ 			       wpa_s->last_tk, wpa_s->last_tk_len,
+-			       KEY_FLAG_PAIRWISE_RX_TX);
++			       KEY_FLAG_PAIRWISE_RX_TX, false);
+ }
+ 
+ 
+diff --git a/wpa_supplicant/driver_i.h b/wpa_supplicant/driver_i.h
+index f259ac36f..4263ec307 100644
+--- a/wpa_supplicant/driver_i.h
++++ b/wpa_supplicant/driver_i.h
+@@ -162,7 +162,7 @@ static inline int wpa_drv_set_key(struct wpa_supplicant *wpa_s, int link_id,
+ 				  int key_idx, int set_tx,
+ 				  const u8 *seq, size_t seq_len,
+ 				  const u8 *key, size_t key_len,
+-				  enum key_flag key_flag)
++				  enum key_flag key_flag, bool preassoc_key)
+ {
+ 	struct wpa_driver_set_key_params params;
+ 
+@@ -178,6 +178,7 @@ static inline int wpa_drv_set_key(struct wpa_supplicant *wpa_s, int link_id,
+ 	params.key_len = key_len;
+ 	params.key_flag = key_flag;
+ 	params.link_id = link_id;
++	params.preassoc_key = preassoc_key;
+ 
+ 	if (alg != WPA_ALG_NONE) {
+ 		/* keyidx = 1 can be either a broadcast or--with
+diff --git a/wpa_supplicant/events.c b/wpa_supplicant/events.c
+index 7ea1199cb..dc75efa46 100644
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -3304,7 +3304,7 @@ static int wpa_supplicant_use_own_rsne_params(struct wpa_supplicant *wpa_s,
+ 		if (wpa_s->conf->key_mgmt_offload &&
+ 		    (wpa_s->drv_flags & WPA_DRIVER_FLAGS_KEY_MGMT_OFFLOAD) &&
+ 		    wpa_drv_set_key(wpa_s, -1, 0, NULL, 0, 0, NULL, 0,
+-				    ssid->psk, PMK_LEN, KEY_FLAG_PMK))
++				    ssid->psk, PMK_LEN, KEY_FLAG_PMK, false))
+ 			wpa_dbg(wpa_s, MSG_ERROR,
+ 				"WPA: Cannot set PMK for key management offload");
+ 	}
+diff --git a/wpa_supplicant/ibss_rsn.c b/wpa_supplicant/ibss_rsn.c
+index 06228d0ef..cfa50a3d3 100644
+--- a/wpa_supplicant/ibss_rsn.c
++++ b/wpa_supplicant/ibss_rsn.c
+@@ -180,7 +180,7 @@ static int supp_set_key(void *ctx, int link_id, enum wpa_alg alg,
+ 		addr = peer->addr;
+ 	return wpa_drv_set_key(peer->ibss_rsn->wpa_s, link_id, alg, addr,
+ 			       key_idx, set_tx, seq, seq_len, key, key_len,
+-			       key_flag);
++			       key_flag, false);
+ }
+ 
+ 
+@@ -366,7 +366,7 @@ static int auth_set_key(void *ctx, int vlan_id, enum wpa_alg alg,
+ 	}
+ 
+ 	return wpa_drv_set_key(ibss_rsn->wpa_s, -1, alg, addr, idx,
+-			       1, seq, 6, key, key_len, key_flag);
++			       1, seq, 6, key, key_len, key_flag, false);
+ }
+ 
+ 
+@@ -882,7 +882,7 @@ static void ibss_rsn_handle_auth_1_of_2(struct ibss_rsn *ibss_rsn,
+ 		wpa_printf(MSG_DEBUG, "RSN: Clear pairwise key for peer "
+ 			   MACSTR, MAC2STR(addr));
+ 		wpa_drv_set_key(ibss_rsn->wpa_s, -1, WPA_ALG_NONE, addr, 0, 0,
+-				NULL, 0, NULL, 0, KEY_FLAG_PAIRWISE);
++				NULL, 0, NULL, 0, KEY_FLAG_PAIRWISE, false);
+ 	}
+ 
+ 	if (peer &&
+diff --git a/wpa_supplicant/mesh_mpm.c b/wpa_supplicant/mesh_mpm.c
+index b2fc1271e..e23128367 100644
+--- a/wpa_supplicant/mesh_mpm.c
++++ b/wpa_supplicant/mesh_mpm.c
+@@ -921,7 +921,7 @@ static void mesh_mpm_plink_estab(struct wpa_supplicant *wpa_s,
+ 				wpa_cipher_to_alg(conf->pairwise_cipher),
+ 				sta->addr, 0, 0, seq, sizeof(seq),
+ 				sta->mtk, sta->mtk_len,
+-				KEY_FLAG_PAIRWISE_RX_TX);
++				KEY_FLAG_PAIRWISE_RX_TX, false);
+ 
+ 		wpa_hexdump_key(MSG_DEBUG, "mesh: RX MGTK Key RSC",
+ 				sta->mgtk_rsc, sizeof(sta->mgtk_rsc));
+@@ -932,7 +932,7 @@ static void mesh_mpm_plink_estab(struct wpa_supplicant *wpa_s,
+ 				sta->addr, sta->mgtk_key_id, 0,
+ 				sta->mgtk_rsc, sizeof(sta->mgtk_rsc),
+ 				sta->mgtk, sta->mgtk_len,
+-				KEY_FLAG_GROUP_RX);
++				KEY_FLAG_GROUP_RX, false);
+ 
+ 		if (sta->igtk_len) {
+ 			wpa_hexdump_key(MSG_DEBUG, "mesh: RX IGTK Key RSC",
+@@ -945,7 +945,7 @@ static void mesh_mpm_plink_estab(struct wpa_supplicant *wpa_s,
+ 				sta->addr, sta->igtk_key_id, 0,
+ 				sta->igtk_rsc, sizeof(sta->igtk_rsc),
+ 				sta->igtk, sta->igtk_len,
+-				KEY_FLAG_GROUP_RX);
++				KEY_FLAG_GROUP_RX, false);
+ 		}
+ 	}
+ 
+diff --git a/wpa_supplicant/mesh_rsn.c b/wpa_supplicant/mesh_rsn.c
+index 463137353..a3ae286c5 100644
+--- a/wpa_supplicant/mesh_rsn.c
++++ b/wpa_supplicant/mesh_rsn.c
+@@ -119,7 +119,7 @@ static int auth_set_key(void *ctx, int vlan_id, enum wpa_alg alg,
+ 	wpa_hexdump_key(MSG_DEBUG, "AUTH: set_key - key", key, key_len);
+ 
+ 	return wpa_drv_set_key(mesh_rsn->wpa_s, -1, alg, addr, idx,
+-			       1, seq, 6, key, key_len, key_flag);
++			       1, seq, 6, key, key_len, key_flag, false);
+ }
+ 
+ 
+@@ -217,7 +217,7 @@ static int __mesh_rsn_auth_init(struct mesh_rsn *rsn, const u8 *addr,
+ 				broadcast_ether_addr,
+ 				rsn->igtk_key_id, 1,
+ 				seq, sizeof(seq), rsn->igtk, rsn->igtk_len,
+-				KEY_FLAG_GROUP_TX_DEFAULT);
++				KEY_FLAG_GROUP_TX_DEFAULT, false);
+ 	}
+ 
+ 	/* group privacy / data frames */
+@@ -226,7 +226,8 @@ static int __mesh_rsn_auth_init(struct mesh_rsn *rsn, const u8 *addr,
+ 	wpa_drv_set_key(rsn->wpa_s, -1, wpa_cipher_to_alg(rsn->group_cipher),
+ 			broadcast_ether_addr,
+ 			rsn->mgtk_key_id, 1, seq, sizeof(seq),
+-			rsn->mgtk, rsn->mgtk_len, KEY_FLAG_GROUP_TX_DEFAULT);
++			rsn->mgtk, rsn->mgtk_len, KEY_FLAG_GROUP_TX_DEFAULT,
++			false);
+ 
+ 	return 0;
+ }
+diff --git a/wpa_supplicant/sme.c b/wpa_supplicant/sme.c
+index 583a6f85e..99b6ca37d 100644
+--- a/wpa_supplicant/sme.c
++++ b/wpa_supplicant/sme.c
+@@ -2244,6 +2244,8 @@ void sme_event_auth(struct wpa_supplicant *wpa_s, union wpa_event_data *data)
+ 	if (data->auth.auth_type == WLAN_AUTH_EPPKE) {
+ 		struct pasn_data *pasn = &wpa_s->pasn;
+ 		struct wpa_pasn_params_data pasn_params;
++		enum wpa_alg alg;
++		u8 zero[WPA_TK_MAX_LEN] = {0};
+ 		int res;
+ 
+ 		res = wpas_parse_pasn_frame(pasn, data->auth.auth_type,
+@@ -2269,6 +2271,13 @@ void sme_event_auth(struct wpa_supplicant *wpa_s, union wpa_event_data *data)
+ 
+ 		sme_send_authentication(wpa_s, wpa_s->current_bss,
+ 					wpa_s->current_ssid, 0);
++
++		alg = wpa_cipher_to_alg(pasn_get_cipher(pasn));
++
++		wpa_drv_set_key(wpa_s, -1, alg, pasn->peer_addr, 0, 1,
++				zero, 6, pasn_get_ptk(pasn)->tk,
++				pasn_get_ptk(pasn)->tk_len,
++				KEY_FLAG_PAIRWISE_RX_TX, true);
+ 	}
+ #endif /* CONFIG_ENC_ASSOC */
+ #ifdef CONFIG_SAE
+diff --git a/wpa_supplicant/wpa_supplicant.c b/wpa_supplicant/wpa_supplicant.c
+index 6fe579876..cf89f21b3 100644
+--- a/wpa_supplicant/wpa_supplicant.c
++++ b/wpa_supplicant/wpa_supplicant.c
+@@ -153,7 +153,7 @@ int wpa_set_wep_keys(struct wpa_supplicant *wpa_s, struct wpa_ssid *ssid)
+ 				ssid->wep_key[i], ssid->wep_key_len[i],
+ 				i == ssid->wep_tx_keyidx ?
+ 				KEY_FLAG_GROUP_RX_TX_DEFAULT :
+-				KEY_FLAG_GROUP_RX_TX);
++				KEY_FLAG_GROUP_RX_TX, false);
+ 	}
+ 
+ 	return set;
+@@ -213,7 +213,7 @@ int wpa_supplicant_set_wpa_none_key(struct wpa_supplicant *wpa_s,
+ 	 * and RX from each STA.. */
+ 
+ 	ret = wpa_drv_set_key(wpa_s, -1, alg, NULL, 0, 1, seq, 6, key, keylen,
+-			      KEY_FLAG_GROUP_RX_TX_DEFAULT);
++			      KEY_FLAG_GROUP_RX_TX_DEFAULT, false);
+ 	os_memset(key, 0, sizeof(key));
+ 	return ret;
+ }
+@@ -895,17 +895,19 @@ void wpa_clear_keys(struct wpa_supplicant *wpa_s, const u8 *addr)
+ 		if (wpa_s->keys_cleared & BIT(i))
+ 			continue;
+ 		wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, NULL, i, 0, NULL, 0,
+-				NULL, 0, KEY_FLAG_GROUP);
++				NULL, 0, KEY_FLAG_GROUP, false);
+ 	}
+ 	/* Pairwise Key ID 1 for Extended Key ID is tracked in bit 15 */
+ 	if (~wpa_s->keys_cleared & (BIT(0) | BIT(15)) && addr &&
+ 	    !is_zero_ether_addr(addr)) {
+ 		if (!(wpa_s->keys_cleared & BIT(0)))
+ 			wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, addr, 0, 0,
+-					NULL, 0, NULL, 0, KEY_FLAG_PAIRWISE);
++					NULL, 0, NULL, 0, KEY_FLAG_PAIRWISE,
++					false);
+ 		if (!(wpa_s->keys_cleared & BIT(15)))
+ 			wpa_drv_set_key(wpa_s, -1, WPA_ALG_NONE, addr, 1, 0,
+-					NULL, 0, NULL, 0, KEY_FLAG_PAIRWISE);
++					NULL, 0, NULL, 0, KEY_FLAG_PAIRWISE,
++					false);
+ 		/* MLME-SETPROTECTION.request(None) */
+ 		wpa_drv_mlme_setprotection(
+ 			wpa_s, addr,
+diff --git a/wpa_supplicant/wpas_glue.c b/wpa_supplicant/wpas_glue.c
+index 247dc1d7d..b0a70e8a0 100644
+--- a/wpa_supplicant/wpas_glue.c
++++ b/wpa_supplicant/wpas_glue.c
+@@ -261,7 +261,7 @@ static int wpa_eapol_set_wep_key(void *ctx, int unicast, int keyidx,
+ 			       unicast ? wpa_s->bssid : NULL,
+ 			       keyidx, unicast, NULL, 0, key, keylen,
+ 			       unicast ? KEY_FLAG_PAIRWISE_RX_TX :
+-			       KEY_FLAG_GROUP_RX_TX_DEFAULT);
++			       KEY_FLAG_GROUP_RX_TX_DEFAULT, false);
+ }
+ #endif /* CONFIG_WEP */
+ 
+@@ -376,7 +376,7 @@ static void wpa_supplicant_eapol_cb(struct eapol_sm *eapol,
+ 			"handshake", pmk, pmk_len);
+ 
+ 	if (wpa_drv_set_key(wpa_s, -1, 0, NULL, 0, 0, NULL, 0, pmk,
+-			    pmk_len, KEY_FLAG_PMK)) {
++			    pmk_len, KEY_FLAG_PMK, false)) {
+ 		wpa_printf(MSG_DEBUG, "Failed to set PMK to the driver");
+ 	}
+ 
+@@ -586,7 +586,7 @@ static int wpa_supplicant_set_key(void *_wpa_s, int link_id, enum wpa_alg alg,
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
+ 	ret = wpa_drv_set_key(wpa_s, link_id, alg, addr, key_idx, set_tx, seq,
+-			      seq_len, key, key_len, key_flag);
++			      seq_len, key, key_len, key_flag, false);
+ 	if (ret == 0 && (key_idx == 6 || key_idx == 7) &&
+ 	    alg != WPA_ALG_NONE && key_len > 0)
+ 		wpa_s->bigtk_set = true;
+@@ -1280,7 +1280,8 @@ static int wpa_supplicant_key_mgmt_set_pmk(void *ctx, const u8 *pmk,
+ 	if (wpa_s->conf->key_mgmt_offload &&
+ 	    (wpa_s->drv_flags & WPA_DRIVER_FLAGS_KEY_MGMT_OFFLOAD))
+ 		return wpa_drv_set_key(wpa_s, -1, 0, NULL, 0, 0,
+-				       NULL, 0, pmk, pmk_len, KEY_FLAG_PMK);
++				       NULL, 0, pmk, pmk_len, KEY_FLAG_PMK,
++				       false);
+ 	else
+ 		return 0;
+ }
+-- 
+2.43.0
+
